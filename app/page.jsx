@@ -121,9 +121,24 @@ export default function HomePage() {
     try {
       const { suppressAlerts } = options;
       setError(null);
+
       const res = await fetch("/api/signals");
-      if (!res.ok) throw new Error("Failed to load signals");
-      const json = await res.json();
+      let json = null;
+
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+
+      if (!res.ok || !json) {
+        const msg =
+          json?.details ||
+          json?.error ||
+          `Failed to load signals (HTTP ${res.status} ${res.statusText})`;
+        throw new Error(msg);
+      }
+
       setData(json);
 
       if (json.symbols && json.symbols.length) {
@@ -146,7 +161,9 @@ export default function HomePage() {
       }
     } catch (e) {
       console.error(e);
-      setError("Could not load data. Try again in a moment.");
+      setError(
+        e?.message || "Could not load data. Try again in a moment."
+      );
     } finally {
       setLoading(false);
     }
@@ -208,7 +225,6 @@ export default function HomePage() {
 
   // helper for TradingView symbol
   function getTradingViewSymbol(sym) {
-    // for Binance futures, the ".P" suffix could be used, but spot symbols render fine visually
     return `BINANCE:${sym}`;
   }
 
@@ -300,7 +316,11 @@ export default function HomePage() {
         </div>
 
         {loading && <p>Loading signals from Binance...</p>}
-        {error && <p style={{ color: "#f97373" }}>{error}</p>}
+        {error && (
+          <p style={{ color: "#f97373" }}>
+            {error}
+          </p>
+        )}
 
         <p className="small-muted">
           Auto-refresh every {Math.round(refreshMs / 1000)} seconds. 4H/1D
