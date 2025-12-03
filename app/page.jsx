@@ -1,6 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { fetchFuturesTickers, fetchKlines } from "@/lib/binance";
+import {
+  calcEMA,
+  calcRSI,
+  calcMACD,
+  generateSignal
+} from "@/lib/indicators";
 
 const SIGNAL_COLORS = {
   long: "badge badge-long",
@@ -10,6 +17,94 @@ const SIGNAL_COLORS = {
 
 // default refresh every 20 seconds
 const DEFAULT_REFRESH_MS = 20000;
+
+// 🔧 This replaces the old /api/signals route – it runs entirely in the browser.
+async function buildSignalsInBrowser() {
+  // 1) Get all futures tickers
+  const tickers = await fetchFuturesTickers();
+
+  // 2) Filter USDT perps, sort by volume, take top 15
+  const usdtPerps = tickers
+    .filter((t) => t.symbol.endsWith("USDT"))
+    .map((t) => ({
+      symbol: t.symbol,
+      lastPrice: parseFloat(t.lastPrice),
+      priceChangePercent: parseFloat(t.priceChangePercent),
+      volume: parseFloat(t.quoteVolume || t.volume || 0)
+    }))
+    .sort((a, b) => b.volume - a.volume)
+    .slice(0, 15);
+
+  const results = [];
+
+  // 3) For each symbol, fetch 4H + 1D candles and compute indicators
+  await Promise.all(
+    usdtPerps.map(async (item) => {
+      try {
+        const [k4h, k1d] = await Promise.all([
+          fetchKlines(item.symbol, "4h", 200),
+          fetchKlines(item.symbol, "1d", 200)
+        ]);
+
+        const price = item.lastPrice;
+
+        // 4H indicators
+        const ema20_4h = calcEMA(k4h.closes, 20);
+        const ema50_4h = calcEMA(k4h.closes, 50);
+        const ema200_4h = calcEMA(k4h.closes, 200);
+        const rsi4h = calcRSI(k4h.closes, 14);
+        const macd4h = calcMACD(k4h.closes);
+
+        const sig4h = generateSignal({
+          closes: k4h.closes,
+          ema20: ema20_4h,
+          ema50: ema50_4h,
+          ema200: ema200_4h,
+          rsi: rsi4h,
+          macd: macd4h,
+          price,
+          tf: "4H"
+        });
+
+        // 1D indicators
+        const ema20_1d = calcEMA(k1d.closes, 20);
+        const ema50_1d = calcEMA(k1d.closes, 50);
+        const ema200_1d = calcEMA(k1d.closes, 200);
+        const rsi1d = calcRSI(k1d.closes, 14);
+        const macd1d = calcMACD(k1d.closes);
+
+        const sig1d = generateSignal({
+          closes: k1d.closes,
+          ema20: ema20_1d,
+          ema50: ema50_1d,
+          ema200: ema200_1d,
+          rsi: rsi1d,
+          macd: macd1d,
+          price,
+          tf: "1D"
+        });
+
+        results.push({
+          ...item,
+          signals: {
+            "4h": sig4h,
+            "1d": sig1d
+          }
+        });
+      } catch (e) {
+        console.error("Error computing signals for", item.symbol, e);
+      }
+    })
+  );
+
+  results.sort((a, b) => b.volume - a.volume);
+
+  return {
+    updatedAt: new Date().toISOString(),
+    count: results.length,
+    symbols: results
+  };
+}
 
 export default function HomePage() {
   const [data, setData] = useState(null);
@@ -86,7 +181,6 @@ export default function HomePage() {
       const prev = prevMap[s.symbol];
 
       if (!prev) {
-        // first time we see this symbol – consider long/short as "new"
         if (curr4 === "long" || curr4 === "short") {
           changes.push({ symbol: s.symbol, tf: "4H", dir: curr4 });
         }
@@ -122,23 +216,7 @@ export default function HomePage() {
       const { suppressAlerts } = options;
       setError(null);
 
-      const res = await fetch("/api/signals");
-      let json = null;
-
-      try {
-        json = await res.json();
-      } catch {
-        json = null;
-      }
-
-      if (!res.ok || !json) {
-        const msg =
-          json?.details ||
-          json?.error ||
-          `Failed to load signals (HTTP ${res.status} ${res.statusText})`;
-        throw new Error(msg);
-      }
-
+      const json = await buildSignalsInBrowser();
       setData(json);
 
       if (json.symbols && json.symbols.length) {
@@ -148,11 +226,9 @@ export default function HomePage() {
           suppressAlerts
         );
 
-        // if nothing selected yet, select the first symbol
         if (!selectedSymbol) {
           setSelectedSymbol(json.symbols[0]);
         } else {
-          // keep selected object in sync with latest data
           const updated = json.symbols.find(
             (s) => s.symbol === selectedSymbol.symbol
           );
@@ -161,9 +237,7 @@ export default function HomePage() {
       }
     } catch (e) {
       console.error(e);
-      setError(
-        e?.message || "Could not load data. Try again in a moment."
-      );
+      setError(e?.message || "Could not load data. Try again in a moment.");
     } finally {
       setLoading(false);
     }
@@ -180,11 +254,11 @@ export default function HomePage() {
       loadSignals({ suppressAlerts: false });
     }, refreshMs);
     return () => clearInterval(id);
-  }, [refreshMs, selectedSymbol]); // selectedSymbol used inside loadSignals
+  }, [refreshMs, selectedSymbol]);
 
   const symbols = data?.symbols || [];
 
-  // always sort by highest volume first (extra safety on top of backend sort)
+  // always sort by highest volume first
   const sortedSymbols = [...symbols].sort((a, b) => b.volume - a.volume);
 
   const filteredSymbols = sortedSymbols.filter((s) => {
@@ -316,11 +390,7 @@ export default function HomePage() {
         </div>
 
         {loading && <p>Loading signals from Binance...</p>}
-        {error && (
-          <p style={{ color: "#f97373" }}>
-            {error}
-          </p>
-        )}
+        {error && <p style={{ color: "#f97373" }}>{error}</p>}
 
         <p className="small-muted">
           Auto-refresh every {Math.round(refreshMs / 1000)} seconds. 4H/1D
