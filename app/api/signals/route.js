@@ -18,7 +18,7 @@ export async function GET() {
         volume: parseFloat(t.quoteVolume || t.volume || 0)
       }))
       .sort((a, b) => b.volume - a.volume)
-      .slice(0, 30); // top 30 by volume
+      .slice(0, 15); // ✅ top 15 by volume instead of 30
 
     const results = [];
 
