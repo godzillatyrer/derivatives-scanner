@@ -82,7 +82,7 @@ export async function GET() {
       })
     );
 
-    // FINAL: ensure results are always sorted by volume (highest first)
+    // ensure results are always sorted by volume (highest first)
     results.sort((a, b) => b.volume - a.volume);
 
     return NextResponse.json({
@@ -93,7 +93,10 @@ export async function GET() {
   } catch (error) {
     console.error("API /signals error:", error);
     return NextResponse.json(
-      { error: "Failed to fetch signals" },
+      {
+        error: "Failed to fetch signals",
+        details: String(error?.message || error)
+      },
       { status: 500 }
     );
   }
