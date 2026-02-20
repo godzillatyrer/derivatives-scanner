@@ -92,7 +92,7 @@ export default function PaperTradingPage() {
           <div>
             <h2 className="text-xl font-bold text-white mb-1">Paper Trading</h2>
             <p className="text-sm text-zinc-500">
-              Simulated trading with $10K starting balance — auto-executes signals
+              Simulated trading with $10K starting balance — includes 0.035% fees + slippage
             </p>
           </div>
           <button

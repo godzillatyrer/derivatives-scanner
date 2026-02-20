@@ -52,6 +52,29 @@ export default function PerformancePage() {
     .map(([coin, data]) => ({ coin, ...data }))
     .sort((a, b) => b.totalPnl - a.totalPnl);
 
+  // Monthly breakdown from signal history
+  const monthlyPerf = {};
+  const history = learning?.history || [];
+  for (const sig of history) {
+    if (!sig.outcome || !sig.exitTime) continue;
+    const d = new Date(sig.exitTime);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!monthlyPerf[key]) monthlyPerf[key] = { wins: 0, losses: 0, expired: 0, pnl: 0, trades: 0 };
+    monthlyPerf[key].trades++;
+    if (sig.outcome === 'win') monthlyPerf[key].wins++;
+    else if (sig.outcome === 'loss') monthlyPerf[key].losses++;
+    else monthlyPerf[key].expired++;
+    monthlyPerf[key].pnl += sig.pnlPercent || 0;
+  }
+  const monthlyEntries = Object.entries(monthlyPerf)
+    .map(([month, data]) => ({
+      month,
+      label: new Date(month + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+      ...data,
+      winRate: (data.wins + data.losses) > 0 ? data.wins / (data.wins + data.losses) : 0,
+    }))
+    .sort((a, b) => b.month.localeCompare(a.month));
+
   return (
     <div>
       <Header isConnected={isConnected} lastUpdate={lastUpdate} />
@@ -133,7 +156,7 @@ export default function PerformancePage() {
                 : 'Never'}
             </div>
             <div className="text-xs text-zinc-600 mt-1">
-              Optimizes every {20} resolved signals
+              Optimizes every 50 resolved signals
             </div>
           </Card>
         </div>
@@ -145,6 +168,57 @@ export default function PerformancePage() {
           />
           <WinRateChart weightHistory={learning?.weightHistory} />
         </div>
+
+        {/* Monthly Performance */}
+        {monthlyEntries.length > 0 && (
+          <Card>
+            <h3 className="text-sm font-medium text-zinc-400 mb-3">Monthly Performance</h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-800">
+                    <th className="px-3 py-2 text-left text-xs font-medium text-zinc-500 uppercase">Month</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-zinc-500 uppercase">Trades</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-zinc-500 uppercase">W/L/E</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-zinc-500 uppercase">Win Rate</th>
+                    <th className="px-3 py-2 text-left text-xs font-medium text-zinc-500 uppercase">Total P&L</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/50">
+                  {monthlyEntries.map(entry => (
+                    <tr key={entry.month} className="hover:bg-surface-300/50">
+                      <td className="px-3 py-2 font-medium text-white">{entry.label}</td>
+                      <td className="px-3 py-2 text-zinc-400">{entry.trades}</td>
+                      <td className="px-3 py-2 text-zinc-400">
+                        <span className="text-long">{entry.wins}</span>
+                        {' / '}
+                        <span className="text-short">{entry.losses}</span>
+                        {' / '}
+                        <span className="text-zinc-500">{entry.expired}</span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={clsx(
+                          'font-mono',
+                          entry.winRate > 0.55 ? 'text-long' : entry.winRate < 0.45 ? 'text-short' : 'text-zinc-400'
+                        )}>
+                          {(entry.winRate * 100).toFixed(0)}%
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={clsx(
+                          'font-mono font-medium',
+                          entry.pnl >= 0 ? 'text-long' : 'text-short'
+                        )}>
+                          {entry.pnl >= 0 ? '+' : ''}{entry.pnl.toFixed(2)}%
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
 
         {/* Per-coin performance */}
         {coinEntries.length > 0 && (

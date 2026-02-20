@@ -10,7 +10,7 @@ import { fetchMetaAndAssetCtxs, fetchAllMids, fetchRecentCandles } from '@/lib/h
 import { generateSignal, calculateTPSL } from '@/lib/signals';
 import { loadLearningState, checkSignalOutcomes, recordSignal } from '@/lib/learning';
 import { loadState, saveState } from '@/lib/storage';
-import { TIMEFRAMES } from '@/lib/constants';
+import { TIMEFRAMES, PAPER_TRADING_FEES, SIGNAL_COOLDOWN_MS } from '@/lib/constants';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -85,19 +85,32 @@ function checkPaperPositions(paperState, currentPrices) {
     }
   }
 
-  for (const { pos, exitPrice, reason } of toClose) {
+  for (const { pos, exitPrice: rawExitPrice, reason } of toClose) {
     const isLong = pos.direction?.includes('LONG');
-    const pnlPercent = isLong
+    // Apply slippage: fills slightly worse than theoretical level
+    const slippageAdj = rawExitPrice * PAPER_TRADING_FEES.slippagePct;
+    const exitPrice = isLong ? rawExitPrice - slippageAdj : rawExitPrice + slippageAdj;
+    // Apply taker fee on both entry and exit notional
+    const feeCost = (pos.size * PAPER_TRADING_FEES.takerFee) + (pos.size * PAPER_TRADING_FEES.takerFee);
+
+    const rawPnlPercent = isLong
       ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100
       : ((pos.entryPrice - exitPrice) / pos.entryPrice) * 100;
-    const pnlDollar = (pnlPercent / 100) * pos.size;
+    const rawPnlDollar = (rawPnlPercent / 100) * pos.size;
+    const pnlDollar = rawPnlDollar - feeCost;
+    const pnlPercent = (pnlDollar / pos.size) * 100;
 
     paperState.balance += pos.margin + pnlDollar;
     paperState.closedTrades.push({
       ...pos, exitPrice, exitTime: Date.now(), pnlPercent, pnlDollar, reason,
+      fees: feeCost, slippage: slippageAdj,
       outcome: pnlDollar >= 0 ? 'win' : 'loss',
     });
     paperState.openPositions = paperState.openPositions.filter(p => p.id !== pos.id);
+
+    // Track cooldown — prevent re-entry for this coin
+    if (!paperState.cooldowns) paperState.cooldowns = {};
+    paperState.cooldowns[pos.coin] = Date.now();
 
     if (pnlDollar >= 0) paperState.stats.wins++;
     else paperState.stats.losses++;
@@ -143,6 +156,12 @@ function openPaperTrade(paperState, signal, price, coinConfig) {
   if (signal.direction === 'NEUTRAL') return;
   if (paperState.openPositions.find(p => p.coin === signal.coin)) return;
 
+  // Cooldown check — don't re-enter a coin too soon after exit
+  if (paperState.cooldowns?.[signal.coin]) {
+    const elapsed = Date.now() - paperState.cooldowns[signal.coin];
+    if (elapsed < SIGNAL_COOLDOWN_MS) return;
+  }
+
   const riskAmount = paperState.balance * PAPER_DEFAULTS.riskPerTrade;
   const slDistance = Math.abs(price - signal.stopLoss);
   if (slDistance === 0) return;
@@ -150,13 +169,17 @@ function openPaperTrade(paperState, signal, price, coinConfig) {
   const margin = positionSize / PAPER_DEFAULTS.leverage;
   if (margin > paperState.balance * 0.3) return;
 
+  // Apply entry slippage: fill slightly worse than mid price
+  const slippageAdj = price * PAPER_TRADING_FEES.slippagePct;
+  const entryPrice = signal.direction.includes('LONG') ? price + slippageAdj : price - slippageAdj;
+
   const trade = {
     id: `pt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-    coin: signal.coin, direction: signal.direction, entryPrice: price,
+    coin: signal.coin, direction: signal.direction, entryPrice,
     size: positionSize, margin, stopLoss: signal.stopLoss,
     takeProfit: signal.takeProfits[0], confidence: signal.confidence,
     openTime: Date.now(), leverage: PAPER_DEFAULTS.leverage,
-    calibrated: !!coinConfig.calibratedAt, // track if this used optimized params
+    calibrated: !!coinConfig.calibratedAt,
   };
 
   paperState.openPositions.push(trade);

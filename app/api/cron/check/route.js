@@ -7,6 +7,7 @@
 import { fetchAllMids } from '@/lib/hyperliquid';
 import { loadLearningState, checkSignalOutcomes } from '@/lib/learning';
 import { loadState, saveState } from '@/lib/storage';
+import { PAPER_TRADING_FEES } from '@/lib/constants';
 
 export const dynamic = 'force-dynamic';
 
@@ -49,19 +50,32 @@ function checkPaperPositions(paperState, currentPrices) {
     }
   }
 
-  for (const { pos, exitPrice, reason } of toClose) {
+  for (const { pos, exitPrice: rawExitPrice, reason } of toClose) {
     const isLong = pos.direction?.includes('LONG');
-    const pnlPercent = isLong
+    // Apply slippage
+    const slippageAdj = rawExitPrice * PAPER_TRADING_FEES.slippagePct;
+    const exitPrice = isLong ? rawExitPrice - slippageAdj : rawExitPrice + slippageAdj;
+    // Apply taker fee on entry + exit
+    const feeCost = (pos.size * PAPER_TRADING_FEES.takerFee) * 2;
+
+    const rawPnlPercent = isLong
       ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100
       : ((pos.entryPrice - exitPrice) / pos.entryPrice) * 100;
-    const pnlDollar = (pnlPercent / 100) * pos.size;
+    const rawPnlDollar = (rawPnlPercent / 100) * pos.size;
+    const pnlDollar = rawPnlDollar - feeCost;
+    const pnlPercent = (pnlDollar / pos.size) * 100;
 
     paperState.balance += pos.margin + pnlDollar;
     paperState.closedTrades.push({
       ...pos, exitPrice, exitTime: Date.now(), pnlPercent, pnlDollar, reason,
+      fees: feeCost, slippage: slippageAdj,
       outcome: pnlDollar >= 0 ? 'win' : 'loss',
     });
     paperState.openPositions = paperState.openPositions.filter(p => p.id !== pos.id);
+
+    // Track cooldown
+    if (!paperState.cooldowns) paperState.cooldowns = {};
+    paperState.cooldowns[pos.coin] = Date.now();
 
     if (pnlDollar >= 0) paperState.stats.wins++;
     else paperState.stats.losses++;
@@ -91,6 +105,17 @@ function checkPaperPositions(paperState, currentPrices) {
 
   if (paperState.closedTrades.length > 500) paperState.closedTrades = paperState.closedTrades.slice(-500);
 
+  // Equity snapshot every run (check cron runs every 1 min — more granular than scan's 5 min)
+  if (!paperState.equityHistory) paperState.equityHistory = [];
+  const lastSnap = paperState.equityHistory[paperState.equityHistory.length - 1];
+  if (!lastSnap || Date.now() - lastSnap.t > 60 * 1000) {
+    paperState.equityHistory.push({
+      t: Date.now(), equity: paperState.equity,
+      balance: paperState.balance, positions: paperState.openPositions.length,
+    });
+    if (paperState.equityHistory.length > 2000) paperState.equityHistory = paperState.equityHistory.slice(-2000);
+  }
+
   paperState.lastUpdated = Date.now();
   return toClose.length > 0;
 }
@@ -114,9 +139,8 @@ export async function GET(request) {
     await checkSignalOutcomes(learningState, currentPrices);
     const paperChanged = checkPaperPositions(paperState, currentPrices);
 
-    if (paperChanged) {
-      await saveState(PAPER_KEY, paperState);
-    }
+    // Always save — equity snapshots are taken every minute now
+    await saveState(PAPER_KEY, paperState);
 
     // Update health
     await saveState(HEALTH_KEY, {
