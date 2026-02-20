@@ -1,550 +1,320 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { fetchFuturesTickers, fetchKlines } from "@/lib/binance";
-import {
-  calcEMA,
-  calcRSI,
-  calcMACD,
-  generateSignal
-} from "@/lib/indicators";
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
+import { fetchCandles, fetchMarketUniverse } from "@/lib/hyperliquid";
+import { computeSignalFromCandles, pickPrimarySignal } from "@/lib/strategy";
 
-const SIGNAL_COLORS = {
-  long: "badge badge-long",
-  short: "badge badge-short",
-  neutral: "badge badge-neutral"
+const REFRESH_MS = 5000;
+
+const signalClass = {
+  long: "pill pill-long",
+  short: "pill pill-short",
+  neutral: "pill pill-neutral"
 };
 
-// default refresh every 20 seconds
-const DEFAULT_REFRESH_MS = 20000;
+function tuningFromWinRate(winRate) {
+  if (winRate >= 65) return { rr: 2.3, slAtr: 1.2 };
+  if (winRate >= 55) return { rr: 2.0, slAtr: 1.3 };
+  if (winRate <= 35) return { rr: 1.5, slAtr: 1.7 };
+  return { rr: 1.8, slAtr: 1.45 };
+}
 
-// 🔧 This replaces the old /api/signals route – it runs entirely in the browser.
-async function buildSignalsInBrowser() {
-  // 1) Get all futures tickers
-  const tickers = await fetchFuturesTickers();
+async function pool(items, limit, worker) {
+  const out = [];
+  const queue = [];
 
-  // 2) Filter USDT perps, sort by volume, take top 15
-  const usdtPerps = tickers
-    .filter((t) => t.symbol.endsWith("USDT"))
-    .map((t) => ({
-      symbol: t.symbol,
-      lastPrice: parseFloat(t.lastPrice),
-      priceChangePercent: parseFloat(t.priceChangePercent),
-      volume: parseFloat(t.quoteVolume || t.volume || 0)
-    }))
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, 15);
+  for (const item of items) {
+    const task = Promise.resolve().then(() => worker(item));
+    out.push(task);
 
-  const results = [];
+    if (limit <= items.length) {
+      const p = task.then(() => queue.splice(queue.indexOf(p), 1));
+      queue.push(p);
+      if (queue.length >= limit) await Promise.race(queue);
+    }
+  }
 
-  // 3) For each symbol, fetch 4H + 1D candles and compute indicators
-  await Promise.all(
-    usdtPerps.map(async (item) => {
-      try {
-        const [k4h, k1d] = await Promise.all([
-          fetchKlines(item.symbol, "4h", 200),
-          fetchKlines(item.symbol, "1d", 200)
-        ]);
+  return Promise.all(out);
+}
 
-        const price = item.lastPrice;
+async function buildScannerData(tuning) {
+  const market = await fetchMarketUniverse();
+  const rows = [];
 
-        // 4H indicators
-        const ema20_4h = calcEMA(k4h.closes, 20);
-        const ema50_4h = calcEMA(k4h.closes, 50);
-        const ema200_4h = calcEMA(k4h.closes, 200);
-        const rsi4h = calcRSI(k4h.closes, 14);
-        const macd4h = calcMACD(k4h.closes);
+  await pool(market, 12, async (coin) => {
+    try {
+      const [c4h, c1d] = await Promise.all([
+        fetchCandles(coin.symbol, "4h", 1000 * 60 * 60 * 24 * 80),
+        fetchCandles(coin.symbol, "1d", 1000 * 60 * 60 * 24 * 260)
+      ]);
 
-        const sig4h = generateSignal({
-          closes: k4h.closes,
-          ema20: ema20_4h,
-          ema50: ema50_4h,
-          ema200: ema200_4h,
-          rsi: rsi4h,
-          macd: macd4h,
-          price,
-          tf: "4H"
-        });
+      const signal4h = computeSignalFromCandles({
+        candles: c4h,
+        price: coin.price,
+        tf: "4H",
+        tuning
+      });
+      const signal1d = computeSignalFromCandles({
+        candles: c1d,
+        price: coin.price,
+        tf: "1D",
+        tuning
+      });
 
-        // 1D indicators
-        const ema20_1d = calcEMA(k1d.closes, 20);
-        const ema50_1d = calcEMA(k1d.closes, 50);
-        const ema200_1d = calcEMA(k1d.closes, 200);
-        const rsi1d = calcRSI(k1d.closes, 14);
-        const macd1d = calcMACD(k1d.closes);
+      rows.push({
+        ...coin,
+        signals: {
+          "4h": signal4h,
+          "1d": signal1d,
+          primary: pickPrimarySignal(signal4h, signal1d)
+        }
+      });
+    } catch (error) {
+      console.error("scan error", coin.symbol, error);
+    }
+  });
 
-        const sig1d = generateSignal({
-          closes: k1d.closes,
-          ema20: ema20_1d,
-          ema50: ema50_1d,
-          ema200: ema200_1d,
-          rsi: rsi1d,
-          macd: macd1d,
-          price,
-          tf: "1D"
-        });
-
-        results.push({
-          ...item,
-          signals: {
-            "4h": sig4h,
-            "1d": sig1d
-          }
-        });
-      } catch (e) {
-        console.error("Error computing signals for", item.symbol, e);
-      }
-    })
-  );
-
-  results.sort((a, b) => b.volume - a.volume);
+  rows.sort((a, b) => b.volume - a.volume);
 
   return {
     updatedAt: new Date().toISOString(),
-    count: results.length,
-    symbols: results
+    rows,
+    totals: {
+      coins: rows.length,
+      directional: rows.filter((r) => r.signals.primary.direction !== "neutral").length,
+      longs: rows.filter((r) => r.signals.primary.direction === "long").length,
+      shorts: rows.filter((r) => r.signals.primary.direction === "short").length
+    }
   };
+}
+
+async function fetchPaperState() {
+  const res = await fetch("/api/paper/state", { cache: "no-store" });
+  if (!res.ok) return null;
+  return res.json();
 }
 
 export default function HomePage() {
   const [data, setData] = useState(null);
+  const [paperState, setPaperState] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [timeframe, setTimeframe] = useState("both"); // both | 4h | 1d
-  const [signalFilter, setSignalFilter] = useState("all"); // all | long | short
   const [error, setError] = useState(null);
-  const [selectedSymbol, setSelectedSymbol] = useState(null);
-  const [detailTf, setDetailTf] = useState("4h"); // which TF to show in detail panel
-  const [refreshMs, setRefreshMs] = useState(DEFAULT_REFRESH_MS);
-  const [alertsEnabled, setAlertsEnabled] = useState(false);
+  const [activeSymbol, setActiveSymbol] = useState(null);
+  const [tf, setTf] = useState("4h");
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
 
-  // memory of previous signals so we can detect NEW long/short
-  const prevSignalsRef = useRef({});
+  const winRate = paperState?.winRate ?? 0;
+  const tuning = tuningFromWinRate(winRate);
 
-  function playBeep() {
+  async function refresh() {
     try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      osc.type = "sine";
-      osc.frequency.value = 880;
-      osc.connect(ctx.destination);
-      osc.start();
-      setTimeout(() => {
-        osc.stop();
-        ctx.close();
-      }, 150);
-    } catch (e) {
-      console.warn("Audio beep failed", e);
-    }
-  }
-
-  function maybeNotify(changes) {
-    if (!changes.length) return;
-
-    // sound
-    playBeep();
-
-    // desktop notifications (if allowed)
-    if (!alertsEnabled) return;
-    if (typeof window === "undefined") return;
-    if (!("Notification" in window)) return;
-    if (Notification.permission !== "granted") return;
-
-    changes.slice(0, 3).forEach((c) => {
-      new Notification(`New ${c.dir.toUpperCase()} signal`, {
-        body: `${c.symbol} · ${c.tf}`,
-        tag: `${c.symbol}-${c.tf}-${c.dir}`
-      });
-    });
-  }
-
-  function detectSignalChanges(prevMap, symbols, suppressAlerts = false) {
-    if (suppressAlerts) {
-      // just update ref without making noise
-      const nextMap = {};
-      symbols.forEach((s) => {
-        nextMap[s.symbol] = {
-          "4h": s.signals["4h"].direction,
-          "1d": s.signals["1d"].direction
-        };
-      });
-      prevSignalsRef.current = nextMap;
-      return;
-    }
-
-    const changes = [];
-    const nextMap = {};
-
-    symbols.forEach((s) => {
-      const curr4 = s.signals["4h"].direction;
-      const curr1 = s.signals["1d"].direction;
-      const prev = prevMap[s.symbol];
-
-      if (!prev) {
-        if (curr4 === "long" || curr4 === "short") {
-          changes.push({ symbol: s.symbol, tf: "4H", dir: curr4 });
-        }
-        if (curr1 === "long" || curr1 === "short") {
-          changes.push({ symbol: s.symbol, tf: "1D", dir: curr1 });
-        }
-      } else {
-        if (
-          prev["4h"] !== curr4 &&
-          (curr4 === "long" || curr4 === "short")
-        ) {
-          changes.push({ symbol: s.symbol, tf: "4H", dir: curr4 });
-        }
-        if (
-          prev["1d"] !== curr1 &&
-          (curr1 === "long" || curr1 === "short")
-        ) {
-          changes.push({ symbol: s.symbol, tf: "1D", dir: curr1 });
-        }
-      }
-
-      nextMap[s.symbol] = { "4h": curr4, "1d": curr1 };
-    });
-
-    prevSignalsRef.current = nextMap;
-    if (changes.length) {
-      maybeNotify(changes);
-    }
-  }
-
-  async function loadSignals(options = { suppressAlerts: false }) {
-    try {
-      const { suppressAlerts } = options;
       setError(null);
+      const [scanner, paper] = await Promise.all([
+        buildScannerData(tuning),
+        fetchPaperState()
+      ]);
+      setData(scanner);
+      setPaperState(paper);
 
-      const json = await buildSignalsInBrowser();
-      setData(json);
-
-      if (json.symbols && json.symbols.length) {
-        detectSignalChanges(
-          prevSignalsRef.current,
-          json.symbols,
-          suppressAlerts
-        );
-
-        if (!selectedSymbol) {
-          setSelectedSymbol(json.symbols[0]);
-        } else {
-          const updated = json.symbols.find(
-            (s) => s.symbol === selectedSymbol.symbol
-          );
-          if (updated) setSelectedSymbol(updated);
-        }
+      if (!activeSymbol && scanner.rows.length) {
+        setActiveSymbol(scanner.rows[0]);
+      } else if (activeSymbol) {
+        const updated = scanner.rows.find((r) => r.symbol === activeSymbol.symbol);
+        if (updated) setActiveSymbol(updated);
       }
     } catch (e) {
-      console.error(e);
-      setError(e?.message || "Could not load data. Try again in a moment.");
+      setError(e?.message || "Failed to load scanner");
     } finally {
       setLoading(false);
     }
   }
 
-  // initial load – do NOT trigger alerts yet
   useEffect(() => {
-    loadSignals({ suppressAlerts: true });
-  }, []);
-
-  // auto-refresh according to refreshMs
-  useEffect(() => {
-    const id = setInterval(() => {
-      loadSignals({ suppressAlerts: false });
-    }, refreshMs);
+    refresh();
+    const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
-  }, [refreshMs, selectedSymbol]);
+  }, [winRate]);
 
-  const symbols = data?.symbols || [];
+  const rows = data?.rows || [];
 
-  // always sort by highest volume first
-  const sortedSymbols = [...symbols].sort((a, b) => b.volume - a.volume);
+  const filteredRows = useMemo(() => {
+    return rows.filter((row) => {
+      const matchesSearch = row.symbol.toLowerCase().includes(search.toLowerCase());
+      if (!matchesSearch) return false;
+      if (filter === "all") return true;
+      return row.signals.primary.direction === filter;
+    });
+  }, [rows, search, filter]);
 
-  const filteredSymbols = sortedSymbols.filter((s) => {
-    const sig4h = s.signals["4h"].direction;
-    const sig1d = s.signals["1d"].direction;
+  async function openPaperTrade(row, timeframeKey) {
+    const signal = row.signals[timeframeKey];
+    if (!signal || !["long", "short"].includes(signal.direction)) return;
 
-    let effectiveSignal = "neutral";
+    const res = await fetch("/api/paper/trade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: row.symbol,
+        direction: signal.direction,
+        entry: signal.entry,
+        tp: signal.tp,
+        sl: signal.sl,
+        timeframe: timeframeKey.toUpperCase(),
+        confidence: signal.confidence,
+        reason: signal.reason
+      })
+    });
 
-    if (timeframe === "4h") {
-      effectiveSignal = sig4h;
-    } else if (timeframe === "1d") {
-      effectiveSignal = sig1d;
-    } else {
-      effectiveSignal =
-        sig4h === "long" || sig4h === "short" ? sig4h : sig1d;
-    }
-
-    if (signalFilter === "all") return true;
-    if (signalFilter === "long") return effectiveSignal === "long";
-    if (signalFilter === "short") return effectiveSignal === "short";
-    return true;
-  });
-
-  function handleEnableAlerts() {
-    if (typeof window === "undefined") return;
-    if (!("Notification" in window)) {
-      alert("This browser does not support desktop notifications.");
+    if (!res.ok) {
+      const payload = await res.json().catch(() => ({}));
+      alert(payload.error || "Could not open paper trade");
       return;
     }
-    Notification.requestPermission().then((perm) => {
-      if (perm === "granted") {
-        setAlertsEnabled(true);
-      } else {
-        setAlertsEnabled(false);
-      }
-    });
-  }
 
-  // helper for TradingView symbol
-  function getTradingViewSymbol(sym) {
-    return `BINANCE:${sym}`;
+    const updated = await fetchPaperState();
+    setPaperState(updated);
   }
 
   return (
-    <div className="app-container">
-      <div className="card">
-        <h1>Derivatives Volume Scanner</h1>
-        <p className="small">
-          Source: Binance USDT-M Futures · Timeframes: 4H &amp; 1D · Signals
-          are rule-based and for information only, not financial advice.
-        </p>
-
-        <div className="controls">
-          {/* Timeframe filter */}
-          <span className="small">Timeframe filter:</span>
-          <button
-            className={timeframe === "both" ? "active" : ""}
-            onClick={() => setTimeframe("both")}
-          >
-            Both
-          </button>
-          <button
-            className={timeframe === "4h" ? "active" : ""}
-            onClick={() => setTimeframe("4h")}
-          >
-            4H
-          </button>
-          <button
-            className={timeframe === "1d" ? "active" : ""}
-            onClick={() => setTimeframe("1d")}
-          >
-            1D
-          </button>
-
-          {/* Signal filter */}
-          <span className="small" style={{ marginLeft: 12 }}>
-            Signal:
-          </span>
-          <button
-            className={signalFilter === "all" ? "active" : ""}
-            onClick={() => setSignalFilter("all")}
-          >
-            All
-          </button>
-          <button
-            className={signalFilter === "long" ? "active" : ""}
-            onClick={() => setSignalFilter("long")}
-          >
-            Long only
-          </button>
-          <button
-            className={signalFilter === "short" ? "active" : ""}
-            onClick={() => setSignalFilter("short")}
-          >
-            Short only
-          </button>
-
-          {/* Refresh control */}
-          <span className="small" style={{ marginLeft: 12 }}>
-            Auto-refresh:
-          </span>
-          <select
-            value={refreshMs}
-            onChange={(e) => setRefreshMs(Number(e.target.value))}
-          >
-            <option value={10000}>10s</option>
-            <option value={20000}>20s</option>
-            <option value={30000}>30s</option>
-            <option value={60000}>60s</option>
-          </select>
-
-          {/* Right-side buttons */}
-          <button
-            style={{ marginLeft: "auto" }}
-            onClick={() => loadSignals({ suppressAlerts: false })}
-          >
-            Refresh now
-          </button>
-
-          <button
-            onClick={handleEnableAlerts}
-            style={{
-              borderColor: alertsEnabled ? "#22c55e" : undefined,
-              color: alertsEnabled ? "#bbf7d0" : undefined
-            }}
-          >
-            {alertsEnabled ? "Alerts enabled" : "Enable alerts"}
-          </button>
-        </div>
-
-        {loading && <p>Loading signals from Binance...</p>}
-        {error && <p style={{ color: "#f97373" }}>{error}</p>}
-
-        <p className="small-muted">
-          Auto-refresh every {Math.round(refreshMs / 1000)} seconds. 4H/1D
-          signals don&apos;t need ultra-fast updates, but you can lower it if
-          you want more frequent checks.
-        </p>
-
-        <div className="main-layout">
-          {/* LEFT: TABLE */}
-          <div className="table-wrapper">
-            <table>
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Last</th>
-                  <th>24h %</th>
-                  <th>Volume (quote)</th>
-                  <th>4H</th>
-                  <th>1D</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredSymbols.map((s) => {
-                  const sig4h = s.signals["4h"];
-                  const sig1d = s.signals["1d"];
-                  const isSelected =
-                    selectedSymbol && selectedSymbol.symbol === s.symbol;
-
-                  return (
-                    <tr
-                      key={s.symbol}
-                      className={isSelected ? "selected-row" : ""}
-                      onClick={() => setSelectedSymbol(s)}
-                    >
-                      <td>{s.symbol}</td>
-                      <td>{s.lastPrice.toFixed(4)}</td>
-                      <td
-                        style={{
-                          color:
-                            s.priceChangePercent > 0
-                              ? "#22c55e"
-                              : s.priceChangePercent < 0
-                              ? "#f97373"
-                              : "#e5e7eb"
-                        }}
-                      >
-                        {s.priceChangePercent.toFixed(2)}%
-                      </td>
-                      <td>{s.volume.toFixed(0)}</td>
-                      <td>
-                        <span className={SIGNAL_COLORS[sig4h.direction]}>
-                          {sig4h.direction.toUpperCase()}
-                        </span>
-                      </td>
-                      <td>
-                        <span className={SIGNAL_COLORS[sig1d.direction]}>
-                          {sig1d.direction.toUpperCase()}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {!filteredSymbols.length && !loading && (
-                  <tr>
-                    <td colSpan={6}>No symbols match the current filters.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          {/* RIGHT: DETAILS PANEL */}
-          <div className="detail-card">
-            {selectedSymbol ? (
-              <>
-                <div className="detail-header">
-                  <div>
-                    <div className="detail-symbol">
-                      {selectedSymbol.symbol}
-                    </div>
-                    <div className="detail-price small-muted">
-                      Last price:{" "}
-                      {selectedSymbol.lastPrice.toFixed(4)} · 24h change:{" "}
-                      <span
-                        style={{
-                          color:
-                            selectedSymbol.priceChangePercent > 0
-                              ? "#22c55e"
-                              : selectedSymbol.priceChangePercent < 0
-                              ? "#f97373"
-                              : "#e5e7eb"
-                        }}
-                      >
-                        {selectedSymbol.priceChangePercent.toFixed(2)}%
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="detail-tabs">
-                    <button
-                      className={
-                        "detail-tab" + (detailTf === "4h" ? " active" : "")
-                      }
-                      onClick={() => setDetailTf("4h")}
-                    >
-                      4H
-                    </button>
-                    <button
-                      className={
-                        "detail-tab" + (detailTf === "1d" ? " active" : "")
-                      }
-                      onClick={() => setDetailTf("1d")}
-                    >
-                      1D
-                    </button>
-                  </div>
-                </div>
-
-                {/* TradingView chart embed */}
-                <iframe
-                  key={`${selectedSymbol.symbol}-${detailTf}`}
-                  className="chart-frame"
-                  title={`${selectedSymbol.symbol} chart`}
-                  src={`https://s.tradingview.com/widgetembed/?symbol=${encodeURIComponent(
-                    getTradingViewSymbol(selectedSymbol.symbol)
-                  )}&interval=${
-                    detailTf === "4h" ? "240" : "D"
-                  }&hidesidetoolbar=1&symboledit=1&saveimage=0&theme=dark&style=1&timezone=Etc%2FUTC&hideideas=1&studies=`}
-                  allowFullScreen
-                />
-
-                <div className="reason">
-                  {selectedSymbol.signals[detailTf].reason
-                    .split("\n")
-                    .map((line, i) => (
-                      <div key={i}>{line}</div>
-                    ))}
-                </div>
-              </>
-            ) : (
-              <p className="small-muted">
-                Click on a symbol in the table to see its chart and reasoning.
-              </p>
-            )}
-          </div>
-        </div>
-
-        {data && (
-          <p className="small" style={{ marginTop: 10 }}>
-            Updated at: {new Date(data.updatedAt).toLocaleString()} · Showing{" "}
-            {filteredSymbols.length} of {data.count} pairs
+    <main className="page colorful-bg">
+      <header className="hero">
+        <div>
+          <h1>Hyperliquid Signal HQ</h1>
+          <p>
+            Realtime all-coin scanner, live price updates (5s polling), adaptive win-rate strategy,
+            and one-click paper trade execution.
           </p>
-        )}
-      </div>
-    </div>
+        </div>
+        <div className="hero-actions">
+          <button onClick={refresh}>Refresh now</button>
+          <Link className="nav-link" href="/paper">
+            Open Paper Trading (10k)
+          </Link>
+        </div>
+      </header>
+
+      <section className="stats-grid">
+        <article className="stat vibrant"><span>Coins</span><strong>{data?.totals.coins ?? 0}</strong></article>
+        <article className="stat"><span>Directional</span><strong>{data?.totals.directional ?? 0}</strong></article>
+        <article className="stat"><span>Long / Short</span><strong>{data ? `${data.totals.longs} / ${data.totals.shorts}` : "0 / 0"}</strong></article>
+        <article className="stat"><span>Win ratio</span><strong>{winRate.toFixed(1)}%</strong></article>
+        <article className="stat"><span>Auto RR</span><strong>{tuning.rr.toFixed(2)}</strong></article>
+        <article className="stat"><span>Auto SL ATR</span><strong>{tuning.slAtr.toFixed(2)}x</strong></article>
+      </section>
+
+      <section className="controls">
+        <input placeholder="Search coin..." value={search} onChange={(e) => setSearch(e.target.value)} />
+        <select value={filter} onChange={(e) => setFilter(e.target.value)}>
+          <option value="all">All signals</option>
+          <option value="long">Long only</option>
+          <option value="short">Short only</option>
+        </select>
+        <span className="muted">Realtime updates every {REFRESH_MS / 1000}s</span>
+      </section>
+
+      {loading && <p className="muted">Loading data...</p>}
+      {error && <p className="error">{error}</p>}
+
+      <section className="layout">
+        <div className="table-card">
+          <table>
+            <thead>
+              <tr>
+                <th>Coin</th>
+                <th>Price</th>
+                <th>24h</th>
+                <th>Volume</th>
+                <th>Funding</th>
+                <th>4H</th>
+                <th>1D</th>
+                <th>Chart</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredRows.map((row) => (
+                <tr
+                  key={row.symbol}
+                  className={activeSymbol?.symbol === row.symbol ? "active-row" : ""}
+                  onClick={() => setActiveSymbol(row)}
+                >
+                  <td>{row.symbol}</td>
+                  <td>{row.price.toFixed(4)}</td>
+                  <td className={row.priceChangePercent >= 0 ? "up" : "down"}>{row.priceChangePercent.toFixed(2)}%</td>
+                  <td>{row.volume.toFixed(0)}</td>
+                  <td>{(row.funding * 100).toFixed(4)}%</td>
+                  <td><span className={signalClass[row.signals["4h"].direction]}>{row.signals["4h"].direction}</span></td>
+                  <td><span className={signalClass[row.signals["1d"].direction]}>{row.signals["1d"].direction}</span></td>
+                  <td>
+                    <a
+                      className="inline-link"
+                      href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(
+                        `HYPERLIQUID:${row.symbol}USDC`
+                      )}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      open
+                    </a>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <aside className="detail-card">
+          {activeSymbol ? (
+            <>
+              <div className="detail-top">
+                <div>
+                  <h2>{activeSymbol.symbol}</h2>
+                  <p className="muted">
+                    ${activeSymbol.price.toFixed(4)} · {activeSymbol.priceChangePercent.toFixed(2)}%
+                  </p>
+                </div>
+                <div className="tf-buttons">
+                  <button className={tf === "4h" ? "active" : ""} onClick={() => setTf("4h")}>4H</button>
+                  <button className={tf === "1d" ? "active" : ""} onClick={() => setTf("1d")}>1D</button>
+                </div>
+              </div>
+
+              <iframe
+                key={`${activeSymbol.symbol}-${tf}`}
+                className="chart"
+                title={`${activeSymbol.symbol} realtime chart`}
+                src={`https://s.tradingview.com/widgetembed/?symbol=${encodeURIComponent(
+                  `HYPERLIQUID:${activeSymbol.symbol}USDC`
+                )}&interval=${tf === "4h" ? "240" : "D"}&theme=dark&style=1&timezone=Etc%2FUTC&hidesidetoolbar=1&hideideas=1`}
+              />
+
+              <div className="plan">
+                <span>Entry: {activeSymbol.signals[tf].entry?.toFixed(4) ?? "-"}</span>
+                <span>TP: {activeSymbol.signals[tf].tp?.toFixed(4) ?? "-"}</span>
+                <span>SL: {activeSymbol.signals[tf].sl?.toFixed(4) ?? "-"}</span>
+                <span>Confidence: {activeSymbol.signals[tf].confidence}%</span>
+              </div>
+
+              <div className="action-row">
+                <button onClick={() => openPaperTrade(activeSymbol, tf)}>Paper trade this signal</button>
+                <Link className="inline-link" href="/paper">
+                  View portfolio
+                </Link>
+              </div>
+
+              <pre className="reason">{activeSymbol.signals[tf].reason}</pre>
+            </>
+          ) : (
+            <p className="muted">Select a coin to view live chart and setup details.</p>
+          )}
+        </aside>
+      </section>
+
+      <footer className="footer muted">
+        Updated: {data ? new Date(data.updatedAt).toLocaleString() : "-"} · Open trades: {paperState?.openTrades?.length ?? 0}
+      </footer>
+    </main>
   );
 }
