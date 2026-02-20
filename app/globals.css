@@ -1,6 +1,5 @@
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
+:root { color-scheme: dark; }
 
 :root {
   color-scheme: dark;
@@ -130,9 +129,10 @@ button.active {
   max-height: 72vh;
 }
 
-table {
-  width: 100%;
-  border-collapse: collapse;
+.nav-link,
+.inline-link {
+  color: #93c5fd;
+  text-decoration: none;
   font-size: 12px;
 }
 
@@ -231,6 +231,8 @@ tbody tr:hover {
   gap: 8px;
   margin: 10px 0;
 }
+button { cursor: pointer; }
+button.active { border-color: #22c55e; color: #bbf7d0; }
 
 .plan span {
   font-size: 11px;
@@ -274,6 +276,7 @@ tbody tr:hover {
   justify-content: space-between;
   margin-bottom: 4px;
 }
+.action-row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
 
 .muted {
   color: #8fa4bf;
@@ -284,6 +287,7 @@ tbody tr:hover {
   color: #fca5a5;
   font-size: 12px;
 }
+.history-top { display: flex; justify-content: space-between; align-items: center; }
 
 .footer {
   margin-top: 12px;
