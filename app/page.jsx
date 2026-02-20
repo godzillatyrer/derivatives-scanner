@@ -1,550 +1,346 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { fetchFuturesTickers, fetchKlines } from "@/lib/binance";
+import { useEffect, useMemo, useState } from "react";
+import { fetchCandles, fetchMarketUniverse } from "@/lib/hyperliquid";
 import {
+  calcATR,
+  calcBollinger,
   calcEMA,
-  calcRSI,
   calcMACD,
+  calcRSI,
+  calcStochastic,
   generateSignal
 } from "@/lib/indicators";
 
-const SIGNAL_COLORS = {
-  long: "badge badge-long",
-  short: "badge badge-short",
-  neutral: "badge badge-neutral"
+const LEARNING_KEY = "hl-learning-v2";
+const REFRESH_MS = 15000;
+
+const signalClass = {
+  long: "pill pill-long",
+  short: "pill pill-short",
+  neutral: "pill pill-neutral"
 };
 
-// default refresh every 20 seconds
-const DEFAULT_REFRESH_MS = 20000;
+function defaultLearning() {
+  return { wins: 0, losses: 0, rr: 1.8, slAtr: 1.4 };
+}
 
-// 🔧 This replaces the old /api/signals route – it runs entirely in the browser.
-async function buildSignalsInBrowser() {
-  // 1) Get all futures tickers
-  const tickers = await fetchFuturesTickers();
+function loadLearning() {
+  if (typeof window === "undefined") return defaultLearning();
+  try {
+    const value = window.localStorage.getItem(LEARNING_KEY);
+    return value ? JSON.parse(value) : defaultLearning();
+  } catch {
+    return defaultLearning();
+  }
+}
 
-  // 2) Filter USDT perps, sort by volume, take top 15
-  const usdtPerps = tickers
-    .filter((t) => t.symbol.endsWith("USDT"))
-    .map((t) => ({
-      symbol: t.symbol,
-      lastPrice: parseFloat(t.lastPrice),
-      priceChangePercent: parseFloat(t.priceChangePercent),
-      volume: parseFloat(t.quoteVolume || t.volume || 0)
-    }))
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, 15);
+function persistLearning(next) {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(LEARNING_KEY, JSON.stringify(next));
+  }
+}
 
-  const results = [];
+async function mapWithConcurrency(items, limit, worker) {
+  const outputs = [];
+  const queue = [];
 
-  // 3) For each symbol, fetch 4H + 1D candles and compute indicators
-  await Promise.all(
-    usdtPerps.map(async (item) => {
-      try {
-        const [k4h, k1d] = await Promise.all([
-          fetchKlines(item.symbol, "4h", 200),
-          fetchKlines(item.symbol, "1d", 200)
-        ]);
+  for (const item of items) {
+    const task = Promise.resolve().then(() => worker(item));
+    outputs.push(task);
 
-        const price = item.lastPrice;
+    if (limit <= items.length) {
+      const p = task.then(() => queue.splice(queue.indexOf(p), 1));
+      queue.push(p);
+      if (queue.length >= limit) await Promise.race(queue);
+    }
+  }
 
-        // 4H indicators
-        const ema20_4h = calcEMA(k4h.closes, 20);
-        const ema50_4h = calcEMA(k4h.closes, 50);
-        const ema200_4h = calcEMA(k4h.closes, 200);
-        const rsi4h = calcRSI(k4h.closes, 14);
-        const macd4h = calcMACD(k4h.closes);
+  return Promise.all(outputs);
+}
 
-        const sig4h = generateSignal({
-          closes: k4h.closes,
-          ema20: ema20_4h,
-          ema50: ema50_4h,
-          ema200: ema200_4h,
-          rsi: rsi4h,
-          macd: macd4h,
-          price,
-          tf: "4H"
+async function buildDashboard(tuning) {
+  const marketRows = await fetchMarketUniverse();
+
+  const rows = [];
+
+  await mapWithConcurrency(marketRows, 10, async (coin) => {
+    try {
+      const [candles4h, candles1d] = await Promise.all([
+        fetchCandles(coin.symbol, "4h", 1000 * 60 * 60 * 24 * 80),
+        fetchCandles(coin.symbol, "1d", 1000 * 60 * 60 * 24 * 260)
+      ]);
+
+      const compute = (candles, tf) =>
+        generateSignal({
+          tf,
+          tuning,
+          price: coin.price,
+          ema20: calcEMA(candles.closes, 20),
+          ema50: calcEMA(candles.closes, 50),
+          ema200: calcEMA(candles.closes, 200),
+          rsi: calcRSI(candles.closes, 14),
+          macd: calcMACD(candles.closes),
+          atr: calcATR(candles.highs, candles.lows, candles.closes, 14),
+          stoch: calcStochastic(candles.highs, candles.lows, candles.closes, 14),
+          bollinger: calcBollinger(candles.closes, 20, 2)
         });
 
-        // 1D indicators
-        const ema20_1d = calcEMA(k1d.closes, 20);
-        const ema50_1d = calcEMA(k1d.closes, 50);
-        const ema200_1d = calcEMA(k1d.closes, 200);
-        const rsi1d = calcRSI(k1d.closes, 14);
-        const macd1d = calcMACD(k1d.closes);
+      const signal4h = compute(candles4h, "4H");
+      const signal1d = compute(candles1d, "1D");
 
-        const sig1d = generateSignal({
-          closes: k1d.closes,
-          ema20: ema20_1d,
-          ema50: ema50_1d,
-          ema200: ema200_1d,
-          rsi: rsi1d,
-          macd: macd1d,
-          price,
-          tf: "1D"
-        });
+      const primary =
+        Math.abs(signal4h.score) >= Math.abs(signal1d.score) ? signal4h : signal1d;
 
-        results.push({
-          ...item,
-          signals: {
-            "4h": sig4h,
-            "1d": sig1d
-          }
-        });
-      } catch (e) {
-        console.error("Error computing signals for", item.symbol, e);
-      }
-    })
-  );
+      rows.push({
+        ...coin,
+        signals: {
+          "4h": signal4h,
+          "1d": signal1d,
+          primary
+        }
+      });
+    } catch (error) {
+      console.error("coin scan failed", coin.symbol, error);
+    }
+  });
 
-  results.sort((a, b) => b.volume - a.volume);
+  rows.sort((a, b) => b.volume - a.volume);
+
+  const directional = rows.filter((row) => row.signals.primary.direction !== "neutral");
+  const longs = directional.filter((row) => row.signals.primary.direction === "long").length;
+  const shorts = directional.filter((row) => row.signals.primary.direction === "short").length;
 
   return {
     updatedAt: new Date().toISOString(),
-    count: results.length,
-    symbols: results
+    rows,
+    totals: {
+      coins: rows.length,
+      directional: directional.length,
+      longs,
+      shorts
+    }
   };
 }
 
 export default function HomePage() {
-  const [data, setData] = useState(null);
+  const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [timeframe, setTimeframe] = useState("both"); // both | 4h | 1d
-  const [signalFilter, setSignalFilter] = useState("all"); // all | long | short
   const [error, setError] = useState(null);
-  const [selectedSymbol, setSelectedSymbol] = useState(null);
-  const [detailTf, setDetailTf] = useState("4h"); // which TF to show in detail panel
-  const [refreshMs, setRefreshMs] = useState(DEFAULT_REFRESH_MS);
-  const [alertsEnabled, setAlertsEnabled] = useState(false);
+  const [search, setSearch] = useState("");
+  const [mode, setMode] = useState("all");
+  const [activeSymbol, setActiveSymbol] = useState(null);
+  const [activeTf, setActiveTf] = useState("4h");
+  const [panel, setPanel] = useState("scanner");
+  const [learning, setLearning] = useState(defaultLearning());
 
-  // memory of previous signals so we can detect NEW long/short
-  const prevSignalsRef = useRef({});
-
-  function playBeep() {
+  const scan = async () => {
     try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      osc.type = "sine";
-      osc.frequency.value = 880;
-      osc.connect(ctx.destination);
-      osc.start();
-      setTimeout(() => {
-        osc.stop();
-        ctx.close();
-      }, 150);
-    } catch (e) {
-      console.warn("Audio beep failed", e);
-    }
-  }
-
-  function maybeNotify(changes) {
-    if (!changes.length) return;
-
-    // sound
-    playBeep();
-
-    // desktop notifications (if allowed)
-    if (!alertsEnabled) return;
-    if (typeof window === "undefined") return;
-    if (!("Notification" in window)) return;
-    if (Notification.permission !== "granted") return;
-
-    changes.slice(0, 3).forEach((c) => {
-      new Notification(`New ${c.dir.toUpperCase()} signal`, {
-        body: `${c.symbol} · ${c.tf}`,
-        tag: `${c.symbol}-${c.tf}-${c.dir}`
-      });
-    });
-  }
-
-  function detectSignalChanges(prevMap, symbols, suppressAlerts = false) {
-    if (suppressAlerts) {
-      // just update ref without making noise
-      const nextMap = {};
-      symbols.forEach((s) => {
-        nextMap[s.symbol] = {
-          "4h": s.signals["4h"].direction,
-          "1d": s.signals["1d"].direction
-        };
-      });
-      prevSignalsRef.current = nextMap;
-      return;
-    }
-
-    const changes = [];
-    const nextMap = {};
-
-    symbols.forEach((s) => {
-      const curr4 = s.signals["4h"].direction;
-      const curr1 = s.signals["1d"].direction;
-      const prev = prevMap[s.symbol];
-
-      if (!prev) {
-        if (curr4 === "long" || curr4 === "short") {
-          changes.push({ symbol: s.symbol, tf: "4H", dir: curr4 });
-        }
-        if (curr1 === "long" || curr1 === "short") {
-          changes.push({ symbol: s.symbol, tf: "1D", dir: curr1 });
-        }
-      } else {
-        if (
-          prev["4h"] !== curr4 &&
-          (curr4 === "long" || curr4 === "short")
-        ) {
-          changes.push({ symbol: s.symbol, tf: "4H", dir: curr4 });
-        }
-        if (
-          prev["1d"] !== curr1 &&
-          (curr1 === "long" || curr1 === "short")
-        ) {
-          changes.push({ symbol: s.symbol, tf: "1D", dir: curr1 });
-        }
-      }
-
-      nextMap[s.symbol] = { "4h": curr4, "1d": curr1 };
-    });
-
-    prevSignalsRef.current = nextMap;
-    if (changes.length) {
-      maybeNotify(changes);
-    }
-  }
-
-  async function loadSignals(options = { suppressAlerts: false }) {
-    try {
-      const { suppressAlerts } = options;
       setError(null);
+      const next = await buildDashboard(learning);
+      setDashboard(next);
 
-      const json = await buildSignalsInBrowser();
-      setData(json);
-
-      if (json.symbols && json.symbols.length) {
-        detectSignalChanges(
-          prevSignalsRef.current,
-          json.symbols,
-          suppressAlerts
-        );
-
-        if (!selectedSymbol) {
-          setSelectedSymbol(json.symbols[0]);
-        } else {
-          const updated = json.symbols.find(
-            (s) => s.symbol === selectedSymbol.symbol
-          );
-          if (updated) setSelectedSymbol(updated);
-        }
+      if (!activeSymbol && next.rows.length) {
+        setActiveSymbol(next.rows[0]);
+      } else if (activeSymbol) {
+        const updated = next.rows.find((r) => r.symbol === activeSymbol.symbol);
+        if (updated) setActiveSymbol(updated);
       }
     } catch (e) {
-      console.error(e);
-      setError(e?.message || "Could not load data. Try again in a moment.");
+      setError(e?.message || "Failed to scan Hyperliquid");
     } finally {
       setLoading(false);
     }
-  }
+  };
 
-  // initial load – do NOT trigger alerts yet
   useEffect(() => {
-    loadSignals({ suppressAlerts: true });
+    setLearning(loadLearning());
   }, []);
 
-  // auto-refresh according to refreshMs
   useEffect(() => {
-    const id = setInterval(() => {
-      loadSignals({ suppressAlerts: false });
-    }, refreshMs);
+    scan();
+    const id = setInterval(scan, REFRESH_MS);
     return () => clearInterval(id);
-  }, [refreshMs, selectedSymbol]);
+  }, [learning.rr, learning.slAtr]);
 
-  const symbols = data?.symbols || [];
+  const rows = dashboard?.rows || [];
 
-  // always sort by highest volume first
-  const sortedSymbols = [...symbols].sort((a, b) => b.volume - a.volume);
-
-  const filteredSymbols = sortedSymbols.filter((s) => {
-    const sig4h = s.signals["4h"].direction;
-    const sig1d = s.signals["1d"].direction;
-
-    let effectiveSignal = "neutral";
-
-    if (timeframe === "4h") {
-      effectiveSignal = sig4h;
-    } else if (timeframe === "1d") {
-      effectiveSignal = sig1d;
-    } else {
-      effectiveSignal =
-        sig4h === "long" || sig4h === "short" ? sig4h : sig1d;
-    }
-
-    if (signalFilter === "all") return true;
-    if (signalFilter === "long") return effectiveSignal === "long";
-    if (signalFilter === "short") return effectiveSignal === "short";
-    return true;
-  });
-
-  function handleEnableAlerts() {
-    if (typeof window === "undefined") return;
-    if (!("Notification" in window)) {
-      alert("This browser does not support desktop notifications.");
-      return;
-    }
-    Notification.requestPermission().then((perm) => {
-      if (perm === "granted") {
-        setAlertsEnabled(true);
-      } else {
-        setAlertsEnabled(false);
-      }
+  const filteredRows = useMemo(() => {
+    return rows.filter((row) => {
+      const matches = row.symbol.toLowerCase().includes(search.toLowerCase());
+      if (!matches) return false;
+      if (mode === "all") return true;
+      return row.signals.primary.direction === mode;
     });
+  }, [rows, search, mode]);
+
+  const signalCards = [...filteredRows]
+    .filter((row) => row.signals.primary.direction !== "neutral")
+    .sort((a, b) => b.signals.primary.confidence - a.signals.primary.confidence);
+
+  function markResult(won) {
+    const next = {
+      ...learning,
+      wins: learning.wins + (won ? 1 : 0),
+      losses: learning.losses + (won ? 0 : 1)
+    };
+
+    const total = next.wins + next.losses;
+    const winRate = total === 0 ? 0.5 : next.wins / total;
+
+    next.rr = Math.min(3.2, Math.max(1.2, 1.2 + winRate * 2));
+    next.slAtr = Math.min(2.2, Math.max(1.0, 1.9 - winRate * 0.9));
+
+    setLearning(next);
+    persistLearning(next);
   }
 
-  // helper for TradingView symbol
-  function getTradingViewSymbol(sym) {
-    return `BINANCE:${sym}`;
-  }
+  const totalOutcomes = learning.wins + learning.losses;
+  const winRate = totalOutcomes ? (learning.wins / totalOutcomes) * 100 : 0;
 
   return (
-    <div className="app-container">
-      <div className="card">
-        <h1>Derivatives Volume Scanner</h1>
-        <p className="small">
-          Source: Binance USDT-M Futures · Timeframes: 4H &amp; 1D · Signals
-          are rule-based and for information only, not financial advice.
-        </p>
-
-        <div className="controls">
-          {/* Timeframe filter */}
-          <span className="small">Timeframe filter:</span>
-          <button
-            className={timeframe === "both" ? "active" : ""}
-            onClick={() => setTimeframe("both")}
-          >
-            Both
-          </button>
-          <button
-            className={timeframe === "4h" ? "active" : ""}
-            onClick={() => setTimeframe("4h")}
-          >
-            4H
-          </button>
-          <button
-            className={timeframe === "1d" ? "active" : ""}
-            onClick={() => setTimeframe("1d")}
-          >
-            1D
-          </button>
-
-          {/* Signal filter */}
-          <span className="small" style={{ marginLeft: 12 }}>
-            Signal:
-          </span>
-          <button
-            className={signalFilter === "all" ? "active" : ""}
-            onClick={() => setSignalFilter("all")}
-          >
-            All
-          </button>
-          <button
-            className={signalFilter === "long" ? "active" : ""}
-            onClick={() => setSignalFilter("long")}
-          >
-            Long only
-          </button>
-          <button
-            className={signalFilter === "short" ? "active" : ""}
-            onClick={() => setSignalFilter("short")}
-          >
-            Short only
-          </button>
-
-          {/* Refresh control */}
-          <span className="small" style={{ marginLeft: 12 }}>
-            Auto-refresh:
-          </span>
-          <select
-            value={refreshMs}
-            onChange={(e) => setRefreshMs(Number(e.target.value))}
-          >
-            <option value={10000}>10s</option>
-            <option value={20000}>20s</option>
-            <option value={30000}>30s</option>
-            <option value={60000}>60s</option>
-          </select>
-
-          {/* Right-side buttons */}
-          <button
-            style={{ marginLeft: "auto" }}
-            onClick={() => loadSignals({ suppressAlerts: false })}
-          >
-            Refresh now
-          </button>
-
-          <button
-            onClick={handleEnableAlerts}
-            style={{
-              borderColor: alertsEnabled ? "#22c55e" : undefined,
-              color: alertsEnabled ? "#bbf7d0" : undefined
-            }}
-          >
-            {alertsEnabled ? "Alerts enabled" : "Enable alerts"}
-          </button>
+    <main className="page">
+      <header className="hero">
+        <div>
+          <h1>Hyperliquid Signal Terminal</h1>
+          <p>
+            All-coin scanner with multi-indicator long/short signals, TP/SL plans, and a
+            self-tuning risk profile from previous outcomes.
+          </p>
         </div>
+        <div className="hero-actions">
+          <button onClick={scan}>Refresh</button>
+          <button className={panel === "scanner" ? "active" : ""} onClick={() => setPanel("scanner")}>Scanner</button>
+          <button className={panel === "signals" ? "active" : ""} onClick={() => setPanel("signals")}>Signals</button>
+        </div>
+      </header>
 
-        {loading && <p>Loading signals from Binance...</p>}
-        {error && <p style={{ color: "#f97373" }}>{error}</p>}
+      <section className="stats-grid">
+        <article className="stat"><span>Coins tracked</span><strong>{dashboard?.totals.coins ?? 0}</strong></article>
+        <article className="stat"><span>Directional setups</span><strong>{dashboard?.totals.directional ?? 0}</strong></article>
+        <article className="stat"><span>Long / Short</span><strong>{dashboard ? `${dashboard.totals.longs} / ${dashboard.totals.shorts}` : "0 / 0"}</strong></article>
+        <article className="stat"><span>Win rate</span><strong>{winRate.toFixed(1)}%</strong></article>
+        <article className="stat"><span>Adaptive RR</span><strong>{learning.rr.toFixed(2)}</strong></article>
+        <article className="stat"><span>Adaptive SL ATR</span><strong>{learning.slAtr.toFixed(2)}x</strong></article>
+      </section>
 
-        <p className="small-muted">
-          Auto-refresh every {Math.round(refreshMs / 1000)} seconds. 4H/1D
-          signals don&apos;t need ultra-fast updates, but you can lower it if
-          you want more frequent checks.
-        </p>
+      <section className="controls">
+        <input placeholder="Search coin" value={search} onChange={(e) => setSearch(e.target.value)} />
+        <select value={mode} onChange={(e) => setMode(e.target.value)}>
+          <option value="all">All directions</option>
+          <option value="long">Long only</option>
+          <option value="short">Short only</option>
+        </select>
+        <span className="muted">Auto-refresh: {REFRESH_MS / 1000}s</span>
+      </section>
 
-        <div className="main-layout">
-          {/* LEFT: TABLE */}
-          <div className="table-wrapper">
+      {loading && <p className="muted">Loading market scan...</p>}
+      {error && <p className="error">{error}</p>}
+
+      {panel === "scanner" ? (
+        <section className="layout">
+          <div className="table-card">
             <table>
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th>Last</th>
-                  <th>24h %</th>
-                  <th>Volume (quote)</th>
+                  <th>Coin</th>
+                  <th>Price</th>
+                  <th>24h</th>
+                  <th>Volume</th>
+                  <th>Funding</th>
                   <th>4H</th>
                   <th>1D</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredSymbols.map((s) => {
-                  const sig4h = s.signals["4h"];
-                  const sig1d = s.signals["1d"];
-                  const isSelected =
-                    selectedSymbol && selectedSymbol.symbol === s.symbol;
-
-                  return (
-                    <tr
-                      key={s.symbol}
-                      className={isSelected ? "selected-row" : ""}
-                      onClick={() => setSelectedSymbol(s)}
-                    >
-                      <td>{s.symbol}</td>
-                      <td>{s.lastPrice.toFixed(4)}</td>
-                      <td
-                        style={{
-                          color:
-                            s.priceChangePercent > 0
-                              ? "#22c55e"
-                              : s.priceChangePercent < 0
-                              ? "#f97373"
-                              : "#e5e7eb"
-                        }}
-                      >
-                        {s.priceChangePercent.toFixed(2)}%
-                      </td>
-                      <td>{s.volume.toFixed(0)}</td>
-                      <td>
-                        <span className={SIGNAL_COLORS[sig4h.direction]}>
-                          {sig4h.direction.toUpperCase()}
-                        </span>
-                      </td>
-                      <td>
-                        <span className={SIGNAL_COLORS[sig1d.direction]}>
-                          {sig1d.direction.toUpperCase()}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {!filteredSymbols.length && !loading && (
-                  <tr>
-                    <td colSpan={6}>No symbols match the current filters.</td>
+                {filteredRows.map((row) => (
+                  <tr
+                    key={row.symbol}
+                    className={activeSymbol?.symbol === row.symbol ? "active-row" : ""}
+                    onClick={() => setActiveSymbol(row)}
+                  >
+                    <td>{row.symbol}</td>
+                    <td>{row.price.toFixed(4)}</td>
+                    <td className={row.priceChangePercent >= 0 ? "up" : "down"}>{row.priceChangePercent.toFixed(2)}%</td>
+                    <td>{row.volume.toFixed(0)}</td>
+                    <td>{(row.funding * 100).toFixed(4)}%</td>
+                    <td><span className={signalClass[row.signals["4h"].direction]}>{row.signals["4h"].direction}</span></td>
+                    <td><span className={signalClass[row.signals["1d"].direction]}>{row.signals["1d"].direction}</span></td>
                   </tr>
-                )}
+                ))}
               </tbody>
             </table>
           </div>
 
-          {/* RIGHT: DETAILS PANEL */}
-          <div className="detail-card">
-            {selectedSymbol ? (
+          <aside className="detail-card">
+            {activeSymbol ? (
               <>
-                <div className="detail-header">
+                <div className="detail-top">
                   <div>
-                    <div className="detail-symbol">
-                      {selectedSymbol.symbol}
-                    </div>
-                    <div className="detail-price small-muted">
-                      Last price:{" "}
-                      {selectedSymbol.lastPrice.toFixed(4)} · 24h change:{" "}
-                      <span
-                        style={{
-                          color:
-                            selectedSymbol.priceChangePercent > 0
-                              ? "#22c55e"
-                              : selectedSymbol.priceChangePercent < 0
-                              ? "#f97373"
-                              : "#e5e7eb"
-                        }}
-                      >
-                        {selectedSymbol.priceChangePercent.toFixed(2)}%
-                      </span>
-                    </div>
+                    <h2>{activeSymbol.symbol}</h2>
+                    <p className="muted">
+                      ${activeSymbol.price.toFixed(4)} · {activeSymbol.priceChangePercent.toFixed(2)}%
+                    </p>
                   </div>
-
-                  <div className="detail-tabs">
-                    <button
-                      className={
-                        "detail-tab" + (detailTf === "4h" ? " active" : "")
-                      }
-                      onClick={() => setDetailTf("4h")}
-                    >
-                      4H
-                    </button>
-                    <button
-                      className={
-                        "detail-tab" + (detailTf === "1d" ? " active" : "")
-                      }
-                      onClick={() => setDetailTf("1d")}
-                    >
-                      1D
-                    </button>
+                  <div className="tf-buttons">
+                    <button className={activeTf === "4h" ? "active" : ""} onClick={() => setActiveTf("4h")}>4H</button>
+                    <button className={activeTf === "1d" ? "active" : ""} onClick={() => setActiveTf("1d")}>1D</button>
                   </div>
                 </div>
 
-                {/* TradingView chart embed */}
                 <iframe
-                  key={`${selectedSymbol.symbol}-${detailTf}`}
-                  className="chart-frame"
-                  title={`${selectedSymbol.symbol} chart`}
+                  key={`${activeSymbol.symbol}-${activeTf}`}
+                  className="chart"
+                  title={`${activeSymbol.symbol} chart`}
                   src={`https://s.tradingview.com/widgetembed/?symbol=${encodeURIComponent(
-                    getTradingViewSymbol(selectedSymbol.symbol)
-                  )}&interval=${
-                    detailTf === "4h" ? "240" : "D"
-                  }&hidesidetoolbar=1&symboledit=1&saveimage=0&theme=dark&style=1&timezone=Etc%2FUTC&hideideas=1&studies=`}
-                  allowFullScreen
+                    `HYPERLIQUID:${activeSymbol.symbol}USDC`
+                  )}&interval=${activeTf === "4h" ? "240" : "D"}&theme=dark&style=1&timezone=Etc%2FUTC&hidesidetoolbar=1&hideideas=1`}
                 />
 
-                <div className="reason">
-                  {selectedSymbol.signals[detailTf].reason
-                    .split("\n")
-                    .map((line, i) => (
-                      <div key={i}>{line}</div>
-                    ))}
+                <div className="plan">
+                  <span>Entry: {activeSymbol.signals[activeTf].entry?.toFixed(4) ?? "-"}</span>
+                  <span>TP: {activeSymbol.signals[activeTf].tp?.toFixed(4) ?? "-"}</span>
+                  <span>SL: {activeSymbol.signals[activeTf].sl?.toFixed(4) ?? "-"}</span>
+                  <span>Conf: {activeSymbol.signals[activeTf].confidence}%</span>
+                </div>
+
+                <pre className="reason">{activeSymbol.signals[activeTf].reason}</pre>
+
+                <div className="outcome-buttons">
+                  <button onClick={() => markResult(true)}>TP Hit</button>
+                  <button onClick={() => markResult(false)}>SL Hit</button>
                 </div>
               </>
             ) : (
-              <p className="small-muted">
-                Click on a symbol in the table to see its chart and reasoning.
-              </p>
+              <p className="muted">Pick a coin to inspect signal details.</p>
             )}
-          </div>
-        </div>
+          </aside>
+        </section>
+      ) : (
+        <section className="cards">
+          {signalCards.map((row) => (
+            <article className="signal-card" key={row.symbol}>
+              <div className="signal-head">
+                <h3>{row.symbol}</h3>
+                <span className={signalClass[row.signals.primary.direction]}>{row.signals.primary.direction}</span>
+              </div>
+              <p className="muted">
+                Confidence {row.signals.primary.confidence}% · RR {row.signals.primary.riskReward?.toFixed(2)}
+              </p>
+              <p className="muted">
+                Entry {row.signals.primary.entry?.toFixed(4)} · TP {row.signals.primary.tp?.toFixed(4)} · SL {row.signals.primary.sl?.toFixed(4)}
+              </p>
+              <pre className="reason compact">{row.signals.primary.reason}</pre>
+            </article>
+          ))}
+          {!signalCards.length && !loading && <p className="muted">No directional setups right now.</p>}
+        </section>
+      )}
 
-        {data && (
-          <p className="small" style={{ marginTop: 10 }}>
-            Updated at: {new Date(data.updatedAt).toLocaleString()} · Showing{" "}
-            {filteredSymbols.length} of {data.count} pairs
-          </p>
-        )}
-      </div>
-    </div>
+      <footer className="footer muted">
+        Updated: {dashboard ? new Date(dashboard.updatedAt).toLocaleString() : "-"} ·
+        Live trading execution can be added later via Hyperliquid order endpoints.
+      </footer>
+    </main>
   );
 }
