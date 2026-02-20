@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { href: '/coins', label: 'Coins', icon: CoinsIcon },
   { href: '/signals', label: 'Signals', icon: SignalsIcon },
   { href: '/paper', label: 'Paper Trading', icon: PaperTradingIcon },
+  { href: '/backtest', label: 'Backtester', icon: BacktestIcon },
   { href: '/performance', label: 'Performance', icon: PerformanceIcon },
 ];
 
@@ -103,6 +104,14 @@ function PaperTradingIcon({ className }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <rect x="2" y="3" width="20" height="18" rx="2" /><line x1="2" y1="9" x2="22" y2="9" /><line x1="12" y1="15" x2="12" y2="9" /><line x1="8" y1="13" x2="12" y2="9" /><line x1="16" y1="13" x2="12" y2="9" />
+    </svg>
+  );
+}
+
+function BacktestIcon({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 8V12L14.5 14.5" /><path d="M3.05 11a9 9 0 1 1 .5 4m-.5 5v-5h5" />
     </svg>
   );
 }

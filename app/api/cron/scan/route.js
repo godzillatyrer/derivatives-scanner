@@ -1,9 +1,9 @@
 /**
  * Cron-triggered signal scan.
- * Replaces the background worker for Vercel deployment.
  * Called by Vercel Cron every 2 minutes.
  *
- * Also handles paper trading: opens new positions on strong signals.
+ * Uses per-coin calibrated configs from the auto-calibration cron when
+ * available, otherwise falls back to default thresholds.
  */
 
 import { fetchMetaAndAssetCtxs, fetchAllMids, fetchRecentCandles } from '@/lib/hyperliquid';
@@ -13,22 +13,25 @@ import { loadState, saveState } from '@/lib/storage';
 import { TIMEFRAMES } from '@/lib/constants';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60; // allow up to 60s for full scan
+export const maxDuration = 60;
 
 const PAPER_KEY = 'paper-trading';
 const CACHE_KEY = 'signal-cache';
 const HEALTH_KEY = 'worker-health';
+const CONFIGS_KEY = 'coin-configs';
 const TOP_COINS = 50;
 const BATCH_SIZE = 5;
 
-const PAPER_CONFIG = {
+const PAPER_DEFAULTS = {
   maxPositions: 5,
   riskPerTrade: 0.02,
   minConfidence: 40,
   leverage: 3,
+  atrMultiplierSL: 1.5,
+  rrMultiplier: 1.5,
 };
 
-const MIN_RECORD_CONFIDENCE = 35; // Don't record low-quality noise signals
+const MIN_RECORD_CONFIDENCE = 40; // Only record/trade signals with 40%+ confidence
 
 function defaultPaperState() {
   return {
@@ -40,6 +43,22 @@ function defaultPaperState() {
       bestTrade: 0, worstTrade: 0,
     },
     lastUpdated: Date.now(),
+  };
+}
+
+function getCoinConfig(coinConfigs, coin) {
+  const cc = coinConfigs?.[coin];
+  if (cc && cc.calibratedAt) {
+    return {
+      minConfidence: cc.minConfidence ?? PAPER_DEFAULTS.minConfidence,
+      atrMultiplierSL: cc.atrMultiplierSL ?? PAPER_DEFAULTS.atrMultiplierSL,
+      rrMultiplier: cc.rrMultiplier ?? PAPER_DEFAULTS.rrMultiplier,
+    };
+  }
+  return {
+    minConfidence: PAPER_DEFAULTS.minConfidence,
+    atrMultiplierSL: PAPER_DEFAULTS.atrMultiplierSL,
+    rrMultiplier: PAPER_DEFAULTS.rrMultiplier,
   };
 }
 
@@ -89,7 +108,6 @@ function checkPaperPositions(paperState, currentPrices) {
       ? paperState.stats.wins / (paperState.stats.wins + paperState.stats.losses) : 0;
   }
 
-  // Equity calc
   let unrealized = 0;
   for (const pos of paperState.openPositions) {
     const price = currentPrices[pos.coin];
@@ -108,7 +126,6 @@ function checkPaperPositions(paperState, currentPrices) {
 
   if (paperState.closedTrades.length > 500) paperState.closedTrades = paperState.closedTrades.slice(-500);
 
-  // Equity snapshot
   if (!paperState.equityHistory) paperState.equityHistory = [];
   const lastSnap = paperState.equityHistory[paperState.equityHistory.length - 1];
   if (!lastSnap || Date.now() - lastSnap.t > 5 * 60 * 1000) {
@@ -120,17 +137,17 @@ function checkPaperPositions(paperState, currentPrices) {
   return toClose.length > 0;
 }
 
-function openPaperTrade(paperState, signal, price) {
-  if (paperState.openPositions.length >= PAPER_CONFIG.maxPositions) return;
-  if (signal.confidence < PAPER_CONFIG.minConfidence) return;
+function openPaperTrade(paperState, signal, price, coinConfig) {
+  if (paperState.openPositions.length >= PAPER_DEFAULTS.maxPositions) return;
+  if (signal.confidence < coinConfig.minConfidence) return;
   if (signal.direction === 'NEUTRAL') return;
   if (paperState.openPositions.find(p => p.coin === signal.coin)) return;
 
-  const riskAmount = paperState.balance * PAPER_CONFIG.riskPerTrade;
+  const riskAmount = paperState.balance * PAPER_DEFAULTS.riskPerTrade;
   const slDistance = Math.abs(price - signal.stopLoss);
   if (slDistance === 0) return;
   const positionSize = (riskAmount / slDistance) * price;
-  const margin = positionSize / PAPER_CONFIG.leverage;
+  const margin = positionSize / PAPER_DEFAULTS.leverage;
   if (margin > paperState.balance * 0.3) return;
 
   const trade = {
@@ -138,7 +155,8 @@ function openPaperTrade(paperState, signal, price) {
     coin: signal.coin, direction: signal.direction, entryPrice: price,
     size: positionSize, margin, stopLoss: signal.stopLoss,
     takeProfit: signal.takeProfits[0], confidence: signal.confidence,
-    openTime: Date.now(), leverage: PAPER_CONFIG.leverage,
+    openTime: Date.now(), leverage: PAPER_DEFAULTS.leverage,
+    calibrated: !!coinConfig.calibratedAt, // track if this used optimized params
   };
 
   paperState.openPositions.push(trade);
@@ -148,15 +166,17 @@ function openPaperTrade(paperState, signal, price) {
 }
 
 export async function GET(request) {
-  // Verify cron secret (optional security)
   const authHeader = request.headers.get('authorization');
   if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   try {
-    const learningState = await loadLearningState();
-    const paperState = await loadState(PAPER_KEY, defaultPaperState);
+    const [learningState, paperState, coinConfigs] = await Promise.all([
+      loadLearningState(),
+      loadState(PAPER_KEY, defaultPaperState),
+      loadState(CONFIGS_KEY, () => ({})),
+    ]);
 
     // Fetch market data
     const [assets, mids] = await Promise.all([fetchMetaAndAssetCtxs(), fetchAllMids()]);
@@ -206,10 +226,15 @@ export async function GET(request) {
           const signal = generateSignal(tfData, learningState.weights);
           if (!signal) return null;
 
+          // Use per-coin calibrated TP/SL params
+          const cc = getCoinConfig(coinConfigs, coin);
           const tpslCandles = tfData['4h'] || tfData['1h'] || Object.values(tfData)[0];
-          const tpsl = calculateTPSL(signal, tpslCandles, learningState);
+          const tpsl = calculateTPSL(signal, tpslCandles, {
+            ...learningState,
+            atrMultiplierSL: cc.atrMultiplierSL,
+            rrMultiplier: cc.rrMultiplier,
+          });
 
-          // Record non-neutral signals for learning (skip low-quality noise)
           if (signal.direction !== 'NEUTRAL' && signal.confidence >= MIN_RECORD_CONFIDENCE) {
             await recordSignal({
               coin, direction: signal.direction, confidence: signal.confidence,
@@ -223,6 +248,7 @@ export async function GET(request) {
             volume24h: coinData[coin]?.volume24h || 0,
             openInterest: coinData[coin]?.openInterest || 0,
             funding: coinData[coin]?.funding || 0,
+            calibrated: !!coinConfigs?.[coin]?.calibratedAt,
             ...signal, ...tpsl,
           };
         } catch (err) {
@@ -233,16 +259,20 @@ export async function GET(request) {
       signals.push(...results.filter(Boolean));
     }
 
-    // Open paper trades
+    // Open paper trades using per-coin configs
     let tradesOpened = 0;
     for (const sig of signals) {
-      if (sig.direction !== 'NEUTRAL' && sig.confidence >= PAPER_CONFIG.minConfidence) {
-        if (openPaperTrade(paperState, sig, sig.price)) tradesOpened++;
+      if (sig.direction !== 'NEUTRAL') {
+        const cc = getCoinConfig(coinConfigs, sig.coin);
+        if (sig.confidence >= cc.minConfidence) {
+          if (openPaperTrade(paperState, sig, sig.price, cc)) tradesOpened++;
+        }
       }
     }
 
     // Save everything
     signals.sort((a, b) => b.confidence - a.confidence);
+    const calibratedCount = Object.keys(coinConfigs).length;
     await Promise.all([
       saveState(CACHE_KEY, { signals, coinData, timestamp: Date.now() }),
       saveState(PAPER_KEY, paperState),
@@ -250,6 +280,7 @@ export async function GET(request) {
         status: 'running', lastHeartbeat: Date.now(), lastScan: Date.now(),
         signalCount: signals.length, paperEquity: paperState.equity,
         openPositions: paperState.openPositions.length, isOnline: true,
+        calibratedCoins: calibratedCount,
       }),
     ]);
 
@@ -259,6 +290,7 @@ export async function GET(request) {
       tradesOpened,
       paperEquity: paperState.equity,
       openPositions: paperState.openPositions.length,
+      calibratedCoins: calibratedCount,
     });
   } catch (err) {
     console.error('Cron scan error:', err);
