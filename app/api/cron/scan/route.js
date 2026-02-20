@@ -24,9 +24,11 @@ const BATCH_SIZE = 5;
 const PAPER_CONFIG = {
   maxPositions: 5,
   riskPerTrade: 0.02,
-  minConfidence: 55,
+  minConfidence: 40,
   leverage: 3,
 };
+
+const MIN_RECORD_CONFIDENCE = 35; // Don't record low-quality noise signals
 
 function defaultPaperState() {
   return {
@@ -207,8 +209,8 @@ export async function GET(request) {
           const tpslCandles = tfData['4h'] || tfData['1h'] || Object.values(tfData)[0];
           const tpsl = calculateTPSL(signal, tpslCandles, learningState);
 
-          // Record non-neutral signals for learning
-          if (signal.direction !== 'NEUTRAL') {
+          // Record non-neutral signals for learning (skip low-quality noise)
+          if (signal.direction !== 'NEUTRAL' && signal.confidence >= MIN_RECORD_CONFIDENCE) {
             await recordSignal({
               coin, direction: signal.direction, confidence: signal.confidence,
               entry: tpsl?.entry, stopLoss: tpsl?.stopLoss, takeProfits: tpsl?.takeProfits,
