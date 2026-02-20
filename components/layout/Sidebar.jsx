@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { href: '/', label: 'Dashboard', icon: DashboardIcon },
   { href: '/coins', label: 'Coins', icon: CoinsIcon },
   { href: '/signals', label: 'Signals', icon: SignalsIcon },
+  { href: '/paper', label: 'Paper Trading', icon: PaperTradingIcon },
   { href: '/performance', label: 'Performance', icon: PerformanceIcon },
 ];
 
@@ -94,6 +95,14 @@ function PerformanceIcon({ className }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <line x1="18" y1="20" x2="18" y2="10" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="6" y1="20" x2="6" y2="14" />
+    </svg>
+  );
+}
+
+function PaperTradingIcon({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="3" width="20" height="18" rx="2" /><line x1="2" y1="9" x2="22" y2="9" /><line x1="12" y1="15" x2="12" y2="9" /><line x1="8" y1="13" x2="12" y2="9" /><line x1="16" y1="13" x2="12" y2="9" />
     </svg>
   );
 }
