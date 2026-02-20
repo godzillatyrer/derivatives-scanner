@@ -1,17 +1,13 @@
-import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { loadState } from '@/lib/storage';
 
 export const dynamic = 'force-dynamic';
 
-const HEALTH_FILE = join(process.cwd(), 'data', 'worker-health.json');
-
 export async function GET() {
   try {
-    if (!existsSync(HEALTH_FILE)) {
-      return Response.json({ status: 'offline', lastHeartbeat: null });
+    const data = await loadState('worker-health', null);
+    if (!data) {
+      return Response.json({ status: 'offline', lastHeartbeat: null, isOnline: false });
     }
-    const data = JSON.parse(readFileSync(HEALTH_FILE, 'utf-8'));
-    // Worker is "online" if heartbeat was within last 5 minutes
     const isOnline = data.lastHeartbeat && (Date.now() - data.lastHeartbeat) < 5 * 60 * 1000;
     return Response.json({
       ...data,
@@ -19,6 +15,6 @@ export async function GET() {
       isOnline,
     });
   } catch (err) {
-    return Response.json({ status: 'offline', error: err.message }, { status: 200 });
+    return Response.json({ status: 'offline', error: err.message, isOnline: false });
   }
 }
