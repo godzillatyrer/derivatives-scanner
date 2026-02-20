@@ -4,7 +4,7 @@ export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
-    const state = loadLearningState();
+    const state = await loadLearningState();
     const history = state.history.slice().reverse();
     return Response.json({
       signals: history,
@@ -21,7 +21,7 @@ export async function POST(request) {
     if (!signalId || !outcome) {
       return Response.json({ error: 'signalId and outcome required' }, { status: 400 });
     }
-    const state = resolveSignal(signalId, outcome, exitPrice);
+    const state = await resolveSignal(signalId, outcome, exitPrice);
     return Response.json({ success: true, stats: state.stats });
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });

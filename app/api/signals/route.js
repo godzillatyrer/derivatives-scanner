@@ -1,27 +1,52 @@
-import { fetchMeta, fetchAllMids, fetchRecentCandles } from '@/lib/hyperliquid';
+import { fetchMetaAndAssetCtxs, fetchAllMids, fetchRecentCandles } from '@/lib/hyperliquid';
 import { generateSignal, calculateTPSL } from '@/lib/signals';
 import { loadLearningState, recordSignal, checkSignalOutcomes } from '@/lib/learning';
+import { loadState } from '@/lib/storage';
 import { TIMEFRAMES } from '@/lib/constants';
 
 export const dynamic = 'force-dynamic';
+
+const CACHE_KEY = 'signal-cache';
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const coinFilter = searchParams.get('coin');
   const limit = parseInt(searchParams.get('limit') || '30', 10);
 
-  try {
-    const learningState = loadLearningState();
-    const [assets, mids] = await Promise.all([fetchMeta(), fetchAllMids()]);
+  // Try to return cached signals if recent (< 3 min old)
+  if (!coinFilter) {
+    try {
+      const cached = await loadState(CACHE_KEY, null);
+      if (cached?.signals?.length > 0 && cached.timestamp && Date.now() - cached.timestamp < 3 * 60 * 1000) {
+        const learningState = await loadLearningState();
+        return Response.json({
+          signals: cached.signals.slice(0, limit),
+          meta: {
+            totalCoins: cached.signals.length,
+            signalCount: cached.signals.length,
+            longCount: cached.signals.filter(s => s.direction?.includes('LONG')).length,
+            shortCount: cached.signals.filter(s => s.direction?.includes('SHORT')).length,
+            neutralCount: cached.signals.filter(s => s.direction === 'NEUTRAL').length,
+            learningStats: learningState.stats,
+            cached: true,
+          },
+        });
+      }
+    } catch {
+      // Fall through to generate fresh signals
+    }
+  }
 
-    // Check existing signal outcomes
+  try {
+    const learningState = await loadLearningState();
+    const [assets, mids] = await Promise.all([fetchMetaAndAssetCtxs(), fetchAllMids()]);
+
     const currentPrices = {};
     for (const a of assets) {
       if (mids[a.name]) currentPrices[a.name] = parseFloat(mids[a.name]);
     }
-    checkSignalOutcomes(learningState, currentPrices);
+    await checkSignalOutcomes(learningState, currentPrices);
 
-    // Determine which coins to scan
     let coinsToScan = assets.filter(a => mids[a.name]);
     if (coinFilter) {
       coinsToScan = coinsToScan.filter(a => a.name === coinFilter);
@@ -29,7 +54,6 @@ export async function GET(request) {
       coinsToScan = coinsToScan.slice(0, limit);
     }
 
-    // Fetch candles for all timeframes in parallel
     const signals = [];
     const batchSize = 5;
 
@@ -59,7 +83,6 @@ export async function GET(request) {
             const signal = generateSignal(tfData, learningState.weights);
             if (!signal) return null;
 
-            // Use 4h candles for TP/SL, fallback to 1h
             const tpslCandles = tfData['4h'] || tfData['1h'] || Object.values(tfData)[0];
             const tpsl = calculateTPSL(signal, tpslCandles, learningState);
 
@@ -70,9 +93,8 @@ export async function GET(request) {
               ...tpsl,
             };
 
-            // Record signal for tracking
             if (signal.direction !== 'NEUTRAL') {
-              recordSignal({
+              await recordSignal({
                 coin: coin.name,
                 direction: signal.direction,
                 confidence: signal.confidence,
@@ -94,7 +116,6 @@ export async function GET(request) {
       signals.push(...batchResults.filter(Boolean));
     }
 
-    // Sort by confidence descending
     signals.sort((a, b) => b.confidence - a.confidence);
 
     return Response.json({
