@@ -191,6 +191,100 @@ function StatCard({ label, value, sub, color }) {
   );
 }
 
+function EquityCurve({ history, startingBalance }) {
+  if (!history || history.length < 2) return null;
+
+  const values = history.map(h => h.equity);
+  const min = Math.min(...values, startingBalance * 0.9);
+  const max = Math.max(...values, startingBalance * 1.1);
+  const range = max - min || 1;
+
+  const width = 600;
+  const height = 180;
+  const padding = { top: 10, right: 10, bottom: 25, left: 10 };
+  const chartW = width - padding.left - padding.right;
+  const chartH = height - padding.top - padding.bottom;
+
+  const points = history.map((h, i) => {
+    const x = padding.left + (i / (history.length - 1)) * chartW;
+    const y = padding.top + chartH - ((h.equity - min) / range) * chartH;
+    return `${x},${y}`;
+  });
+
+  const polyline = points.join(' ');
+
+  // Area fill (close the path to the bottom)
+  const firstX = padding.left;
+  const lastX = padding.left + chartW;
+  const bottomY = padding.top + chartH;
+  const areaPath = `M${firstX},${bottomY} L${points.map(p => `L${p}`).join(' ')} L${lastX},${bottomY} Z`;
+
+  const currentEquity = values[values.length - 1];
+  const isProfit = currentEquity >= startingBalance;
+
+  // Starting balance line
+  const baselineY = padding.top + chartH - ((startingBalance - min) / range) * chartH;
+
+  // Time labels
+  const firstTime = new Date(history[0].t);
+  const lastTime = new Date(history[history.length - 1].t);
+  const formatLabel = (d) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+  return (
+    <div className="bg-surface-200 rounded-xl border border-zinc-800 p-6">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-medium text-zinc-400">Equity Curve</h3>
+        <span className={clsx('text-sm font-mono font-medium', isProfit ? 'text-long' : 'text-short')}>
+          {formatMoney(currentEquity)}
+        </span>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full" preserveAspectRatio="none">
+        {/* Area fill */}
+        <path
+          d={areaPath}
+          fill={isProfit ? 'rgba(34, 197, 94, 0.08)' : 'rgba(239, 68, 68, 0.08)'}
+        />
+        {/* Starting balance reference line */}
+        <line
+          x1={padding.left} y1={baselineY}
+          x2={padding.left + chartW} y2={baselineY}
+          stroke="#3f3f46" strokeWidth="1" strokeDasharray="4,4"
+        />
+        {/* Equity line */}
+        <polyline
+          points={polyline}
+          fill="none"
+          stroke={isProfit ? '#22c55e' : '#ef4444'}
+          strokeWidth="2"
+          strokeLinejoin="round"
+        />
+        {/* Current value dot */}
+        {points.length > 0 && (() => {
+          const lastPoint = points[points.length - 1].split(',');
+          return (
+            <circle
+              cx={lastPoint[0]} cy={lastPoint[1]}
+              r="3"
+              fill={isProfit ? '#22c55e' : '#ef4444'}
+            />
+          );
+        })()}
+        {/* Time labels */}
+        <text x={padding.left} y={height - 4} fill="#71717a" fontSize="10" textAnchor="start">
+          {formatLabel(firstTime)}
+        </text>
+        <text x={padding.left + chartW} y={height - 4} fill="#71717a" fontSize="10" textAnchor="end">
+          {formatLabel(lastTime)}
+        </text>
+        {/* Baseline label */}
+        <text x={padding.left + chartW - 2} y={baselineY - 4} fill="#71717a" fontSize="9" textAnchor="end">
+          {formatMoney(startingBalance)}
+        </text>
+      </svg>
+    </div>
+  );
+}
+
 function OverviewTab({ paper }) {
   if (!paper) return null;
   const equity = paper.equity || paper.startingBalance;
@@ -199,6 +293,11 @@ function OverviewTab({ paper }) {
 
   return (
     <div className="space-y-6">
+      {/* Equity Curve */}
+      {paper.equityHistory?.length > 1 && (
+        <EquityCurve history={paper.equityHistory} startingBalance={startBal} />
+      )}
+
       {/* Equity Bar */}
       <div className="bg-surface-200 rounded-xl border border-zinc-800 p-6">
         <h3 className="text-sm font-medium text-zinc-400 mb-4">Equity Progress</h3>

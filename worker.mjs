@@ -4,6 +4,8 @@
  * Runs independently of the browser - keeps generating signals,
  * checking outcomes, and executing paper trades on a schedule.
  *
+ * Uses the FULL 12-indicator signal library (same as the web app).
+ *
  * Usage: node worker.mjs
  */
 
@@ -11,11 +13,15 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
+// Import the full signal generation library (all 12 indicators)
+import { generateSignal, calculateTPSL } from './lib/signals.js';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, 'data');
 const STATE_FILE = join(DATA_DIR, 'learning-state.json');
 const PAPER_FILE = join(DATA_DIR, 'paper-trading.json');
 const CACHE_FILE = join(DATA_DIR, 'signal-cache.json');
+const HEALTH_FILE = join(DATA_DIR, 'worker-health.json');
 
 const HYPERLIQUID_API = 'https://api.hyperliquid.xyz/info';
 
@@ -24,9 +30,9 @@ const SCAN_INTERVAL_MS = 2 * 60 * 1000;   // scan every 2 minutes
 const OUTCOME_CHECK_MS = 30 * 1000;        // check outcomes every 30s
 const TOP_COINS_COUNT = 50;                 // scan top 50 coins by volume
 const BATCH_SIZE = 5;
+const EQUITY_SNAPSHOT_INTERVAL = 5 * 60 * 1000; // snapshot equity every 5 min
 
 const TIMEFRAMES = ['15m', '1h', '4h', '1d'];
-const TIMEFRAME_WEIGHTS = { '15m': 0.15, '1h': 0.25, '4h': 0.35, '1d': 0.25 };
 
 // ── Helpers ──
 function ensureDataDir() {
@@ -69,194 +75,6 @@ async function fetchRecentCandles(coin, interval, count = 300) {
   }));
 }
 
-// ── Indicators (inline for standalone worker) ──
-function calcEMA(closes, period) {
-  const k = 2 / (period + 1);
-  const ema = [closes[0]];
-  for (let i = 1; i < closes.length; i++) {
-    ema.push(closes[i] * k + ema[i - 1] * (1 - k));
-  }
-  return ema;
-}
-
-function calcRSI(closes, period = 14) {
-  const gains = [], losses = [];
-  for (let i = 1; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    gains.push(diff > 0 ? diff : 0);
-    losses.push(diff < 0 ? -diff : 0);
-  }
-  let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  const rsi = [];
-  for (let i = period; i < gains.length; i++) {
-    avgGain = (avgGain * (period - 1) + gains[i]) / period;
-    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
-    rsi.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
-  }
-  return rsi;
-}
-
-function calcMACD(closes) {
-  const ema12 = calcEMA(closes, 12);
-  const ema26 = calcEMA(closes, 26);
-  const macdLine = ema12.map((v, i) => v - ema26[i]);
-  const signalLine = calcEMA(macdLine.slice(26), 9);
-  return { macdLine: macdLine.slice(26), signalLine };
-}
-
-function calcATR(candles, period = 14) {
-  const trs = [];
-  for (let i = 1; i < candles.length; i++) {
-    const tr = Math.max(
-      candles[i].high - candles[i].low,
-      Math.abs(candles[i].high - candles[i - 1].close),
-      Math.abs(candles[i].low - candles[i - 1].close)
-    );
-    trs.push(tr);
-  }
-  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < trs.length; i++) {
-    atr = (atr * (period - 1) + trs[i]) / period;
-  }
-  return atr;
-}
-
-function calcBollingerBands(closes, period = 20) {
-  if (closes.length < period) return null;
-  const slice = closes.slice(-period);
-  const mean = slice.reduce((a, b) => a + b, 0) / period;
-  const std = Math.sqrt(slice.reduce((s, v) => s + (v - mean) ** 2, 0) / period);
-  return { upper: mean + 2 * std, middle: mean, lower: mean - 2 * std, std };
-}
-
-function calcStochRSI(closes) {
-  const rsi = calcRSI(closes, 14);
-  if (rsi.length < 14) return null;
-  const period = 14;
-  const recent = rsi.slice(-period);
-  const min = Math.min(...recent);
-  const max = Math.max(...recent);
-  const k = max === min ? 50 : ((rsi[rsi.length - 1] - min) / (max - min)) * 100;
-  return { k, d: k }; // simplified
-}
-
-// ── Signal Generation (simplified for worker) ──
-function generateSignalFromCandles(tfData, weights) {
-  const scores = {};
-  let compositeScore = 0;
-  let totalWeight = 0;
-
-  for (const [tf, candles] of Object.entries(tfData)) {
-    if (!candles || candles.length < 52) continue;
-    const closes = candles.map(c => c.close);
-    const price = closes[closes.length - 1];
-    let tfScore = 0;
-    let tfWeight = 0;
-
-    // EMA
-    const ema9 = calcEMA(closes, 9);
-    const ema21 = calcEMA(closes, 21);
-    const ema50 = calcEMA(closes, 50);
-    const e9 = ema9[ema9.length - 1], e21 = ema21[ema21.length - 1], e50 = ema50[ema50.length - 1];
-    let emaScore = 0;
-    if (e9 > e21 && e21 > e50) emaScore = 0.7;
-    else if (e9 < e21 && e21 < e50) emaScore = -0.7;
-    else if (price > e50) emaScore = 0.3;
-    else if (price < e50) emaScore = -0.3;
-    tfScore += emaScore * (weights.ema || 0.12);
-    tfWeight += weights.ema || 0.12;
-
-    // RSI
-    const rsi = calcRSI(closes);
-    if (rsi.length > 0) {
-      const currentRSI = rsi[rsi.length - 1];
-      let rsiScore = 0;
-      if (currentRSI < 30) rsiScore = 0.7;
-      else if (currentRSI < 40) rsiScore = 0.3;
-      else if (currentRSI > 70) rsiScore = -0.7;
-      else if (currentRSI > 60) rsiScore = -0.3;
-      tfScore += rsiScore * (weights.rsi || 0.10);
-      tfWeight += weights.rsi || 0.10;
-    }
-
-    // MACD
-    const macd = calcMACD(closes);
-    if (macd.signalLine.length > 0) {
-      const macdVal = macd.macdLine[macd.macdLine.length - 1];
-      const sigVal = macd.signalLine[macd.signalLine.length - 1];
-      let macdScore = 0;
-      if (macdVal > sigVal) macdScore = 0.5;
-      else macdScore = -0.5;
-      if (macdVal > 0) macdScore += 0.2;
-      else macdScore -= 0.2;
-      tfScore += Math.max(-1, Math.min(1, macdScore)) * (weights.macd || 0.12);
-      tfWeight += weights.macd || 0.12;
-    }
-
-    // Bollinger Bands
-    const bb = calcBollingerBands(closes);
-    if (bb) {
-      let bbScore = 0;
-      if (price <= bb.lower) bbScore = 0.6;
-      else if (price >= bb.upper) bbScore = -0.6;
-      else if (price < bb.middle) bbScore = 0.2;
-      else bbScore = -0.2;
-      tfScore += bbScore * (weights.bollingerBands || 0.08);
-      tfWeight += weights.bollingerBands || 0.08;
-    }
-
-    // Stoch RSI
-    const stoch = calcStochRSI(closes);
-    if (stoch) {
-      let stochScore = 0;
-      if (stoch.k < 20) stochScore = 0.6;
-      else if (stoch.k > 80) stochScore = -0.6;
-      tfScore += stochScore * (weights.stochRsi || 0.08);
-      tfWeight += weights.stochRsi || 0.08;
-    }
-
-    const weight = TIMEFRAME_WEIGHTS[tf] || 0.25;
-    scores[tf] = tfWeight > 0 ? tfScore / tfWeight : 0;
-    compositeScore += scores[tf] * weight;
-    totalWeight += weight;
-  }
-
-  if (totalWeight === 0) return null;
-  compositeScore /= totalWeight;
-
-  let direction;
-  if (compositeScore >= 0.4) direction = 'STRONG_LONG';
-  else if (compositeScore >= 0.2) direction = 'LONG';
-  else if (compositeScore <= -0.4) direction = 'STRONG_SHORT';
-  else if (compositeScore <= -0.2) direction = 'SHORT';
-  else direction = 'NEUTRAL';
-
-  // Check multi-TF agreement
-  const tfScores = Object.values(scores);
-  const allAgree = tfScores.every(s => Math.sign(s) === Math.sign(compositeScore));
-  let confidence = Math.abs(compositeScore) * 100;
-  if (allAgree) confidence *= 1.2;
-  else if (tfScores.some(s => Math.sign(s) !== Math.sign(compositeScore))) confidence *= 0.7;
-  confidence = Math.min(99, Math.round(confidence));
-
-  return { direction, score: compositeScore, confidence, timeframeScores: scores };
-}
-
-function calculateTPSL(signal, candles, learningState) {
-  const price = candles[candles.length - 1].close;
-  const atr = calcATR(candles);
-  const mult = learningState?.atrMultiplierSL || 1.5;
-  const rr = learningState?.rrMultiplier || 1.5;
-  const isLong = signal.direction?.includes('LONG');
-  const slDistance = atr * mult;
-  const stopLoss = isLong ? price - slDistance : price + slDistance;
-  const tp1 = isLong ? price + slDistance * rr : price - slDistance * rr;
-  const tp2 = isLong ? price + slDistance * rr * 2 : price - slDistance * rr * 2;
-  const tp3 = isLong ? price + slDistance * rr * 3 : price - slDistance * rr * 3;
-  return { entry: price, stopLoss, takeProfits: [tp1, tp2, tp3] };
-}
-
 // ── State Management ──
 function loadJSON(file, defaultVal) {
   ensureDataDir();
@@ -294,6 +112,7 @@ function loadPaperState() {
     equity: 10000,
     openPositions: [],
     closedTrades: [],
+    equityHistory: [],
     stats: {
       totalTrades: 0, wins: 0, losses: 0, winRate: 0,
       totalPnl: 0, maxDrawdown: 0, peakEquity: 10000,
@@ -301,6 +120,17 @@ function loadPaperState() {
     },
     lastUpdated: Date.now(),
   }));
+}
+
+// ── Worker Health ──
+function writeHealth(status, extra = {}) {
+  saveJSON(HEALTH_FILE, {
+    status,
+    pid: process.pid,
+    uptime: process.uptime(),
+    lastHeartbeat: Date.now(),
+    ...extra,
+  });
 }
 
 // ── Paper Trading Engine ──
@@ -315,7 +145,6 @@ function openPaperTrade(paperState, signal, price) {
   if (paperState.openPositions.length >= PAPER_CONFIG.maxPositions) return;
   if (signal.confidence < PAPER_CONFIG.minConfidence) return;
   if (signal.direction === 'NEUTRAL') return;
-  // Don't double up on same coin
   if (paperState.openPositions.find(p => p.coin === signal.coin)) return;
 
   const riskAmount = paperState.balance * PAPER_CONFIG.riskPerTrade;
@@ -324,7 +153,7 @@ function openPaperTrade(paperState, signal, price) {
   const positionSize = (riskAmount / slDistance) * price;
   const margin = positionSize / PAPER_CONFIG.leverage;
 
-  if (margin > paperState.balance * 0.3) return; // don't use more than 30% balance on one trade
+  if (margin > paperState.balance * 0.3) return;
 
   const trade = {
     id: `pt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -356,17 +185,14 @@ function checkPaperPositions(paperState, currentPrices) {
     const isLong = pos.direction?.includes('LONG');
     let closeReason = null;
 
-    // Check SL
     if (isLong && price <= pos.stopLoss) closeReason = 'stop_loss';
     else if (!isLong && price >= pos.stopLoss) closeReason = 'stop_loss';
 
-    // Check TP
     if (!closeReason) {
       if (isLong && price >= pos.takeProfit) closeReason = 'take_profit';
       else if (!isLong && price <= pos.takeProfit) closeReason = 'take_profit';
     }
 
-    // Expire after 48h
     if (!closeReason && Date.now() - pos.openTime > 48 * 60 * 60 * 1000) {
       closeReason = 'expired';
     }
@@ -410,7 +236,7 @@ function checkPaperPositions(paperState, currentPrices) {
       ? paperState.stats.wins / (paperState.stats.wins + paperState.stats.losses) : 0;
   }
 
-  // Calculate equity (balance + unrealized PnL)
+  // Calculate equity
   let unrealized = 0;
   for (const pos of paperState.openPositions) {
     const price = currentPrices[pos.coin];
@@ -424,7 +250,6 @@ function checkPaperPositions(paperState, currentPrices) {
   paperState.equity = paperState.balance + unrealized +
     paperState.openPositions.reduce((s, p) => s + p.margin, 0);
 
-  // Track drawdown
   if (paperState.equity > paperState.stats.peakEquity) {
     paperState.stats.peakEquity = paperState.equity;
   }
@@ -433,13 +258,29 @@ function checkPaperPositions(paperState, currentPrices) {
     paperState.stats.maxDrawdown = drawdown;
   }
 
-  // Keep closed trades bounded (last 500)
   if (paperState.closedTrades.length > 500) {
     paperState.closedTrades = paperState.closedTrades.slice(-500);
   }
 
   paperState.lastUpdated = Date.now();
   return toClose.length > 0;
+}
+
+function snapshotEquity(paperState) {
+  if (!paperState.equityHistory) paperState.equityHistory = [];
+  const last = paperState.equityHistory[paperState.equityHistory.length - 1];
+  // Only snapshot if enough time has passed
+  if (last && Date.now() - last.t < EQUITY_SNAPSHOT_INTERVAL) return;
+  paperState.equityHistory.push({
+    t: Date.now(),
+    equity: paperState.equity,
+    balance: paperState.balance,
+    positions: paperState.openPositions.length,
+  });
+  // Keep last 2000 snapshots (~7 days at 5 min intervals)
+  if (paperState.equityHistory.length > 2000) {
+    paperState.equityHistory = paperState.equityHistory.slice(-2000);
+  }
 }
 
 // ── Outcome Checking ──
@@ -493,18 +334,19 @@ function checkOutcomes(learningState, currentPrices) {
 
 // ── Main Loop ──
 let isScanning = false;
+let scanCount = 0;
 
 async function runSignalScan() {
   if (isScanning) return;
   isScanning = true;
+  scanCount++;
   const start = Date.now();
 
   try {
-    console.log(`[${new Date().toISOString()}] Starting signal scan...`);
+    console.log(`[${new Date().toISOString()}] Scan #${scanCount} starting...`);
     const learningState = loadLearningState();
     const paperState = loadPaperState();
 
-    // Fetch meta + asset contexts (includes volume, OI)
     const [metaCtxs, mids] = await Promise.all([fetchMetaAndCtxs(), fetchAllMids()]);
     const [meta, ctxs] = metaCtxs;
 
@@ -527,11 +369,8 @@ async function runSignalScan() {
       }
     }
 
-    // Check signal outcomes
     checkOutcomes(learningState, currentPrices);
-
-    // Check paper positions
-    const paperChanged = checkPaperPositions(paperState, currentPrices);
+    checkPaperPositions(paperState, currentPrices);
 
     // Sort coins by volume, take top N
     const sortedCoins = Object.entries(coinData)
@@ -539,7 +378,7 @@ async function runSignalScan() {
       .slice(0, TOP_COINS_COUNT)
       .map(([name]) => name);
 
-    // Generate signals in batches
+    // Generate signals using FULL 12-indicator library
     const signals = [];
     for (let i = 0; i < sortedCoins.length; i += BATCH_SIZE) {
       const batch = sortedCoins.slice(i, i + BATCH_SIZE);
@@ -559,7 +398,8 @@ async function runSignalScan() {
           }
           if (Object.keys(tfData).length === 0) return null;
 
-          const signal = generateSignalFromCandles(tfData, learningState.weights);
+          // Use the full generateSignal from lib/signals.js (all 12 indicators)
+          const signal = generateSignal(tfData, learningState.weights);
           if (!signal) return null;
 
           const tpslCandles = tfData['4h'] || tfData['1h'] || Object.values(tfData)[0];
@@ -592,20 +432,28 @@ async function runSignalScan() {
       }
     }
 
+    // Snapshot equity for chart
+    snapshotEquity(paperState);
+
     // Save everything
     signals.sort((a, b) => b.confidence - a.confidence);
-    saveJSON(CACHE_FILE, {
-      signals,
-      coinData,
-      timestamp: Date.now(),
-    });
+    saveJSON(CACHE_FILE, { signals, coinData, timestamp: Date.now() });
     saveJSON(PAPER_FILE, paperState);
 
+    writeHealth('running', {
+      lastScan: Date.now(),
+      signalCount: signals.length,
+      paperEquity: paperState.equity,
+      openPositions: paperState.openPositions.length,
+      scanNumber: scanCount,
+    });
+
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`[${new Date().toISOString()}] Scan complete: ${signals.length} signals in ${elapsed}s`);
+    console.log(`[${new Date().toISOString()}] Scan #${scanCount} complete: ${signals.length} signals (12 indicators) in ${elapsed}s`);
     console.log(`  Paper: Balance=$${paperState.balance.toFixed(2)} Equity=$${paperState.equity.toFixed(2)} Open=${paperState.openPositions.length} Trades=${paperState.stats.totalTrades}`);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Scan error:`, err.message);
+    writeHealth('error', { error: err.message, lastError: Date.now() });
   } finally {
     isScanning = false;
   }
@@ -621,13 +469,16 @@ async function runOutcomeCheck() {
       currentPrices[coin] = parseFloat(price);
     }
 
-    const outcomesChanged = checkOutcomes(learningState, currentPrices);
+    checkOutcomes(learningState, currentPrices);
     const paperChanged = checkPaperPositions(paperState, currentPrices);
 
     if (paperChanged) {
+      snapshotEquity(paperState);
       saveJSON(PAPER_FILE, paperState);
       console.log(`[${new Date().toISOString()}] Paper positions updated - Balance: $${paperState.balance.toFixed(2)}`);
     }
+
+    writeHealth('running', { lastHeartbeat: Date.now(), scanNumber: scanCount });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Outcome check error:`, err.message);
   }
@@ -635,11 +486,12 @@ async function runOutcomeCheck() {
 
 // ── Start ──
 console.log('=== HyperSignals Background Worker ===');
+console.log('Signal engine: FULL 12-indicator suite (EMA, RSI, MACD, StochRSI, BB, ADX, Ichimoku, OBV, VWAP, Fib, VolProfile, ATR)');
 console.log(`Scan interval: ${SCAN_INTERVAL_MS / 1000}s | Outcome check: ${OUTCOME_CHECK_MS / 1000}s`);
 console.log(`Top coins: ${TOP_COINS_COUNT} | Paper starting balance: $10,000`);
 console.log('');
 
-// Run immediately, then on intervals
+writeHealth('starting');
 runSignalScan();
 setInterval(runSignalScan, SCAN_INTERVAL_MS);
 setInterval(runOutcomeCheck, OUTCOME_CHECK_MS);
