@@ -1,11 +1,19 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { fetchCandles, fetchMarketUniverse } from "@/lib/hyperliquid";
-import { computeSignalFromCandles, pickPrimarySignal } from "@/lib/strategy";
+import {
+  calcATR,
+  calcBollinger,
+  calcEMA,
+  calcMACD,
+  calcRSI,
+  calcStochastic,
+  generateSignal
+} from "@/lib/indicators";
 
-const REFRESH_MS = 5000;
+const LEARNING_KEY = "hl-learning-v2";
+const REFRESH_MS = 15000;
 
 const signalClass = {
   long: "pill pill-long",
@@ -13,20 +21,33 @@ const signalClass = {
   neutral: "pill pill-neutral"
 };
 
-function tuningFromWinRate(winRate) {
-  if (winRate >= 65) return { rr: 2.3, slAtr: 1.2 };
-  if (winRate >= 55) return { rr: 2.0, slAtr: 1.3 };
-  if (winRate <= 35) return { rr: 1.5, slAtr: 1.7 };
-  return { rr: 1.8, slAtr: 1.45 };
+function defaultLearning() {
+  return { wins: 0, losses: 0, rr: 1.8, slAtr: 1.4 };
 }
 
-async function pool(items, limit, worker) {
-  const out = [];
+function loadLearning() {
+  if (typeof window === "undefined") return defaultLearning();
+  try {
+    const value = window.localStorage.getItem(LEARNING_KEY);
+    return value ? JSON.parse(value) : defaultLearning();
+  } catch {
+    return defaultLearning();
+  }
+}
+
+function persistLearning(next) {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(LEARNING_KEY, JSON.stringify(next));
+  }
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const outputs = [];
   const queue = [];
 
   for (const item of items) {
     const task = Promise.resolve().then(() => worker(item));
-    out.push(task);
+    outputs.push(task);
 
     if (limit <= items.length) {
       const p = task.then(() => queue.splice(queue.indexOf(p), 1));
@@ -35,285 +56,290 @@ async function pool(items, limit, worker) {
     }
   }
 
-  return Promise.all(out);
+  return Promise.all(outputs);
 }
 
-async function buildScannerData(tuning) {
-  const market = await fetchMarketUniverse();
+async function buildDashboard(tuning) {
+  const marketRows = await fetchMarketUniverse();
+
   const rows = [];
 
-  await pool(market, 12, async (coin) => {
+  await mapWithConcurrency(marketRows, 10, async (coin) => {
     try {
-      const [c4h, c1d] = await Promise.all([
+      const [candles4h, candles1d] = await Promise.all([
         fetchCandles(coin.symbol, "4h", 1000 * 60 * 60 * 24 * 80),
         fetchCandles(coin.symbol, "1d", 1000 * 60 * 60 * 24 * 260)
       ]);
 
-      const signal4h = computeSignalFromCandles({
-        candles: c4h,
-        price: coin.price,
-        tf: "4H",
-        tuning
-      });
-      const signal1d = computeSignalFromCandles({
-        candles: c1d,
-        price: coin.price,
-        tf: "1D",
-        tuning
-      });
+      const compute = (candles, tf) =>
+        generateSignal({
+          tf,
+          tuning,
+          price: coin.price,
+          ema20: calcEMA(candles.closes, 20),
+          ema50: calcEMA(candles.closes, 50),
+          ema200: calcEMA(candles.closes, 200),
+          rsi: calcRSI(candles.closes, 14),
+          macd: calcMACD(candles.closes),
+          atr: calcATR(candles.highs, candles.lows, candles.closes, 14),
+          stoch: calcStochastic(candles.highs, candles.lows, candles.closes, 14),
+          bollinger: calcBollinger(candles.closes, 20, 2)
+        });
+
+      const signal4h = compute(candles4h, "4H");
+      const signal1d = compute(candles1d, "1D");
+
+      const primary =
+        Math.abs(signal4h.score) >= Math.abs(signal1d.score) ? signal4h : signal1d;
 
       rows.push({
         ...coin,
         signals: {
           "4h": signal4h,
           "1d": signal1d,
-          primary: pickPrimarySignal(signal4h, signal1d)
+          primary
         }
       });
     } catch (error) {
-      console.error("scan error", coin.symbol, error);
+      console.error("coin scan failed", coin.symbol, error);
     }
   });
 
   rows.sort((a, b) => b.volume - a.volume);
+
+  const directional = rows.filter((row) => row.signals.primary.direction !== "neutral");
+  const longs = directional.filter((row) => row.signals.primary.direction === "long").length;
+  const shorts = directional.filter((row) => row.signals.primary.direction === "short").length;
 
   return {
     updatedAt: new Date().toISOString(),
     rows,
     totals: {
       coins: rows.length,
-      directional: rows.filter((r) => r.signals.primary.direction !== "neutral").length,
-      longs: rows.filter((r) => r.signals.primary.direction === "long").length,
-      shorts: rows.filter((r) => r.signals.primary.direction === "short").length
+      directional: directional.length,
+      longs,
+      shorts
     }
   };
 }
 
-async function fetchPaperState() {
-  const res = await fetch("/api/paper/state", { cache: "no-store" });
-  if (!res.ok) return null;
-  return res.json();
-}
-
 export default function HomePage() {
-  const [data, setData] = useState(null);
-  const [paperState, setPaperState] = useState(null);
+  const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [activeSymbol, setActiveSymbol] = useState(null);
-  const [tf, setTf] = useState("4h");
-  const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
+  const [mode, setMode] = useState("all");
+  const [activeSymbol, setActiveSymbol] = useState(null);
+  const [activeTf, setActiveTf] = useState("4h");
+  const [panel, setPanel] = useState("scanner");
+  const [learning, setLearning] = useState(defaultLearning());
 
-  const winRate = paperState?.winRate ?? 0;
-  const tuning = tuningFromWinRate(winRate);
-
-  async function refresh() {
+  const scan = async () => {
     try {
       setError(null);
-      const [scanner, paper] = await Promise.all([
-        buildScannerData(tuning),
-        fetchPaperState()
-      ]);
-      setData(scanner);
-      setPaperState(paper);
+      const next = await buildDashboard(learning);
+      setDashboard(next);
 
-      if (!activeSymbol && scanner.rows.length) {
-        setActiveSymbol(scanner.rows[0]);
+      if (!activeSymbol && next.rows.length) {
+        setActiveSymbol(next.rows[0]);
       } else if (activeSymbol) {
-        const updated = scanner.rows.find((r) => r.symbol === activeSymbol.symbol);
+        const updated = next.rows.find((r) => r.symbol === activeSymbol.symbol);
         if (updated) setActiveSymbol(updated);
       }
     } catch (e) {
-      setError(e?.message || "Failed to load scanner");
+      setError(e?.message || "Failed to scan Hyperliquid");
     } finally {
       setLoading(false);
     }
-  }
+  };
 
   useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, REFRESH_MS);
-    return () => clearInterval(id);
-  }, [winRate]);
+    setLearning(loadLearning());
+  }, []);
 
-  const rows = data?.rows || [];
+  useEffect(() => {
+    scan();
+    const id = setInterval(scan, REFRESH_MS);
+    return () => clearInterval(id);
+  }, [learning.rr, learning.slAtr]);
+
+  const rows = dashboard?.rows || [];
 
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
-      const matchesSearch = row.symbol.toLowerCase().includes(search.toLowerCase());
-      if (!matchesSearch) return false;
-      if (filter === "all") return true;
-      return row.signals.primary.direction === filter;
+      const matches = row.symbol.toLowerCase().includes(search.toLowerCase());
+      if (!matches) return false;
+      if (mode === "all") return true;
+      return row.signals.primary.direction === mode;
     });
-  }, [rows, search, filter]);
+  }, [rows, search, mode]);
 
-  async function openPaperTrade(row, timeframeKey) {
-    const signal = row.signals[timeframeKey];
-    if (!signal || !["long", "short"].includes(signal.direction)) return;
+  const signalCards = [...filteredRows]
+    .filter((row) => row.signals.primary.direction !== "neutral")
+    .sort((a, b) => b.signals.primary.confidence - a.signals.primary.confidence);
 
-    const res = await fetch("/api/paper/trade", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: row.symbol,
-        direction: signal.direction,
-        entry: signal.entry,
-        tp: signal.tp,
-        sl: signal.sl,
-        timeframe: timeframeKey.toUpperCase(),
-        confidence: signal.confidence,
-        reason: signal.reason
-      })
-    });
+  function markResult(won) {
+    const next = {
+      ...learning,
+      wins: learning.wins + (won ? 1 : 0),
+      losses: learning.losses + (won ? 0 : 1)
+    };
 
-    if (!res.ok) {
-      const payload = await res.json().catch(() => ({}));
-      alert(payload.error || "Could not open paper trade");
-      return;
-    }
+    const total = next.wins + next.losses;
+    const winRate = total === 0 ? 0.5 : next.wins / total;
 
-    const updated = await fetchPaperState();
-    setPaperState(updated);
+    next.rr = Math.min(3.2, Math.max(1.2, 1.2 + winRate * 2));
+    next.slAtr = Math.min(2.2, Math.max(1.0, 1.9 - winRate * 0.9));
+
+    setLearning(next);
+    persistLearning(next);
   }
 
+  const totalOutcomes = learning.wins + learning.losses;
+  const winRate = totalOutcomes ? (learning.wins / totalOutcomes) * 100 : 0;
+
   return (
-    <main className="page colorful-bg">
+    <main className="page">
       <header className="hero">
         <div>
-          <h1>Hyperliquid Signal HQ</h1>
+          <h1>Hyperliquid Signal Terminal</h1>
           <p>
-            Realtime all-coin scanner, live price updates (5s polling), adaptive win-rate strategy,
-            and one-click paper trade execution.
+            All-coin scanner with multi-indicator long/short signals, TP/SL plans, and a
+            self-tuning risk profile from previous outcomes.
           </p>
         </div>
         <div className="hero-actions">
-          <button onClick={refresh}>Refresh now</button>
-          <Link className="nav-link" href="/paper">
-            Open Paper Trading (10k)
-          </Link>
+          <button onClick={scan}>Refresh</button>
+          <button className={panel === "scanner" ? "active" : ""} onClick={() => setPanel("scanner")}>Scanner</button>
+          <button className={panel === "signals" ? "active" : ""} onClick={() => setPanel("signals")}>Signals</button>
         </div>
       </header>
 
       <section className="stats-grid">
-        <article className="stat vibrant"><span>Coins</span><strong>{data?.totals.coins ?? 0}</strong></article>
-        <article className="stat"><span>Directional</span><strong>{data?.totals.directional ?? 0}</strong></article>
-        <article className="stat"><span>Long / Short</span><strong>{data ? `${data.totals.longs} / ${data.totals.shorts}` : "0 / 0"}</strong></article>
-        <article className="stat"><span>Win ratio</span><strong>{winRate.toFixed(1)}%</strong></article>
-        <article className="stat"><span>Auto RR</span><strong>{tuning.rr.toFixed(2)}</strong></article>
-        <article className="stat"><span>Auto SL ATR</span><strong>{tuning.slAtr.toFixed(2)}x</strong></article>
+        <article className="stat"><span>Coins tracked</span><strong>{dashboard?.totals.coins ?? 0}</strong></article>
+        <article className="stat"><span>Directional setups</span><strong>{dashboard?.totals.directional ?? 0}</strong></article>
+        <article className="stat"><span>Long / Short</span><strong>{dashboard ? `${dashboard.totals.longs} / ${dashboard.totals.shorts}` : "0 / 0"}</strong></article>
+        <article className="stat"><span>Win rate</span><strong>{winRate.toFixed(1)}%</strong></article>
+        <article className="stat"><span>Adaptive RR</span><strong>{learning.rr.toFixed(2)}</strong></article>
+        <article className="stat"><span>Adaptive SL ATR</span><strong>{learning.slAtr.toFixed(2)}x</strong></article>
       </section>
 
       <section className="controls">
-        <input placeholder="Search coin..." value={search} onChange={(e) => setSearch(e.target.value)} />
-        <select value={filter} onChange={(e) => setFilter(e.target.value)}>
-          <option value="all">All signals</option>
+        <input placeholder="Search coin" value={search} onChange={(e) => setSearch(e.target.value)} />
+        <select value={mode} onChange={(e) => setMode(e.target.value)}>
+          <option value="all">All directions</option>
           <option value="long">Long only</option>
           <option value="short">Short only</option>
         </select>
-        <span className="muted">Realtime updates every {REFRESH_MS / 1000}s</span>
+        <span className="muted">Auto-refresh: {REFRESH_MS / 1000}s</span>
       </section>
 
-      {loading && <p className="muted">Loading data...</p>}
+      {loading && <p className="muted">Loading market scan...</p>}
       {error && <p className="error">{error}</p>}
 
-      <section className="layout">
-        <div className="table-card">
-          <table>
-            <thead>
-              <tr>
-                <th>Coin</th>
-                <th>Price</th>
-                <th>24h</th>
-                <th>Volume</th>
-                <th>Funding</th>
-                <th>4H</th>
-                <th>1D</th>
-                <th>Chart</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredRows.map((row) => (
-                <tr
-                  key={row.symbol}
-                  className={activeSymbol?.symbol === row.symbol ? "active-row" : ""}
-                  onClick={() => setActiveSymbol(row)}
-                >
-                  <td>{row.symbol}</td>
-                  <td>{row.price.toFixed(4)}</td>
-                  <td className={row.priceChangePercent >= 0 ? "up" : "down"}>{row.priceChangePercent.toFixed(2)}%</td>
-                  <td>{row.volume.toFixed(0)}</td>
-                  <td>{(row.funding * 100).toFixed(4)}%</td>
-                  <td><span className={signalClass[row.signals["4h"].direction]}>{row.signals["4h"].direction}</span></td>
-                  <td><span className={signalClass[row.signals["1d"].direction]}>{row.signals["1d"].direction}</span></td>
-                  <td>
-                    <a
-                      className="inline-link"
-                      href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(
-                        `HYPERLIQUID:${row.symbol}USDC`
-                      )}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      open
-                    </a>
-                  </td>
+      {panel === "scanner" ? (
+        <section className="layout">
+          <div className="table-card">
+            <table>
+              <thead>
+                <tr>
+                  <th>Coin</th>
+                  <th>Price</th>
+                  <th>24h</th>
+                  <th>Volume</th>
+                  <th>Funding</th>
+                  <th>4H</th>
+                  <th>1D</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {filteredRows.map((row) => (
+                  <tr
+                    key={row.symbol}
+                    className={activeSymbol?.symbol === row.symbol ? "active-row" : ""}
+                    onClick={() => setActiveSymbol(row)}
+                  >
+                    <td>{row.symbol}</td>
+                    <td>{row.price.toFixed(4)}</td>
+                    <td className={row.priceChangePercent >= 0 ? "up" : "down"}>{row.priceChangePercent.toFixed(2)}%</td>
+                    <td>{row.volume.toFixed(0)}</td>
+                    <td>{(row.funding * 100).toFixed(4)}%</td>
+                    <td><span className={signalClass[row.signals["4h"].direction]}>{row.signals["4h"].direction}</span></td>
+                    <td><span className={signalClass[row.signals["1d"].direction]}>{row.signals["1d"].direction}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
-        <aside className="detail-card">
-          {activeSymbol ? (
-            <>
-              <div className="detail-top">
-                <div>
-                  <h2>{activeSymbol.symbol}</h2>
-                  <p className="muted">
-                    ${activeSymbol.price.toFixed(4)} · {activeSymbol.priceChangePercent.toFixed(2)}%
-                  </p>
+          <aside className="detail-card">
+            {activeSymbol ? (
+              <>
+                <div className="detail-top">
+                  <div>
+                    <h2>{activeSymbol.symbol}</h2>
+                    <p className="muted">
+                      ${activeSymbol.price.toFixed(4)} · {activeSymbol.priceChangePercent.toFixed(2)}%
+                    </p>
+                  </div>
+                  <div className="tf-buttons">
+                    <button className={activeTf === "4h" ? "active" : ""} onClick={() => setActiveTf("4h")}>4H</button>
+                    <button className={activeTf === "1d" ? "active" : ""} onClick={() => setActiveTf("1d")}>1D</button>
+                  </div>
                 </div>
-                <div className="tf-buttons">
-                  <button className={tf === "4h" ? "active" : ""} onClick={() => setTf("4h")}>4H</button>
-                  <button className={tf === "1d" ? "active" : ""} onClick={() => setTf("1d")}>1D</button>
+
+                <iframe
+                  key={`${activeSymbol.symbol}-${activeTf}`}
+                  className="chart"
+                  title={`${activeSymbol.symbol} chart`}
+                  src={`https://s.tradingview.com/widgetembed/?symbol=${encodeURIComponent(
+                    `HYPERLIQUID:${activeSymbol.symbol}USDC`
+                  )}&interval=${activeTf === "4h" ? "240" : "D"}&theme=dark&style=1&timezone=Etc%2FUTC&hidesidetoolbar=1&hideideas=1`}
+                />
+
+                <div className="plan">
+                  <span>Entry: {activeSymbol.signals[activeTf].entry?.toFixed(4) ?? "-"}</span>
+                  <span>TP: {activeSymbol.signals[activeTf].tp?.toFixed(4) ?? "-"}</span>
+                  <span>SL: {activeSymbol.signals[activeTf].sl?.toFixed(4) ?? "-"}</span>
+                  <span>Conf: {activeSymbol.signals[activeTf].confidence}%</span>
                 </div>
+
+                <pre className="reason">{activeSymbol.signals[activeTf].reason}</pre>
+
+                <div className="outcome-buttons">
+                  <button onClick={() => markResult(true)}>TP Hit</button>
+                  <button onClick={() => markResult(false)}>SL Hit</button>
+                </div>
+              </>
+            ) : (
+              <p className="muted">Pick a coin to inspect signal details.</p>
+            )}
+          </aside>
+        </section>
+      ) : (
+        <section className="cards">
+          {signalCards.map((row) => (
+            <article className="signal-card" key={row.symbol}>
+              <div className="signal-head">
+                <h3>{row.symbol}</h3>
+                <span className={signalClass[row.signals.primary.direction]}>{row.signals.primary.direction}</span>
               </div>
-
-              <iframe
-                key={`${activeSymbol.symbol}-${tf}`}
-                className="chart"
-                title={`${activeSymbol.symbol} realtime chart`}
-                src={`https://s.tradingview.com/widgetembed/?symbol=${encodeURIComponent(
-                  `HYPERLIQUID:${activeSymbol.symbol}USDC`
-                )}&interval=${tf === "4h" ? "240" : "D"}&theme=dark&style=1&timezone=Etc%2FUTC&hidesidetoolbar=1&hideideas=1`}
-              />
-
-              <div className="plan">
-                <span>Entry: {activeSymbol.signals[tf].entry?.toFixed(4) ?? "-"}</span>
-                <span>TP: {activeSymbol.signals[tf].tp?.toFixed(4) ?? "-"}</span>
-                <span>SL: {activeSymbol.signals[tf].sl?.toFixed(4) ?? "-"}</span>
-                <span>Confidence: {activeSymbol.signals[tf].confidence}%</span>
-              </div>
-
-              <div className="action-row">
-                <button onClick={() => openPaperTrade(activeSymbol, tf)}>Paper trade this signal</button>
-                <Link className="inline-link" href="/paper">
-                  View portfolio
-                </Link>
-              </div>
-
-              <pre className="reason">{activeSymbol.signals[tf].reason}</pre>
-            </>
-          ) : (
-            <p className="muted">Select a coin to view live chart and setup details.</p>
-          )}
-        </aside>
-      </section>
+              <p className="muted">
+                Confidence {row.signals.primary.confidence}% · RR {row.signals.primary.riskReward?.toFixed(2)}
+              </p>
+              <p className="muted">
+                Entry {row.signals.primary.entry?.toFixed(4)} · TP {row.signals.primary.tp?.toFixed(4)} · SL {row.signals.primary.sl?.toFixed(4)}
+              </p>
+              <pre className="reason compact">{row.signals.primary.reason}</pre>
+            </article>
+          ))}
+          {!signalCards.length && !loading && <p className="muted">No directional setups right now.</p>}
+        </section>
+      )}
 
       <footer className="footer muted">
-        Updated: {data ? new Date(data.updatedAt).toLocaleString() : "-"} · Open trades: {paperState?.openTrades?.length ?? 0}
+        Updated: {dashboard ? new Date(dashboard.updatedAt).toLocaleString() : "-"} ·
+        Live trading execution can be added later via Hyperliquid order endpoints.
       </footer>
     </main>
   );

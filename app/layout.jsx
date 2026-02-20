@@ -1,9 +1,9 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Hyperliquid Signal HQ",
+  title: "Hyperliquid Signal Terminal",
   description:
-    "All-coin Hyperliquid scanner with real-time updates, adaptive win-rate strategy, and paper trading portfolio"
+    "Realtime Hyperliquid scanner with multi-indicator trade signals, TP/SL planning and adaptive tuning"
 };
 
 export default function RootLayout({ children }) {
