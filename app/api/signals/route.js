@@ -93,7 +93,7 @@ export async function GET(request) {
               ...tpsl,
             };
 
-            if (signal.direction !== 'NEUTRAL' && signal.confidence >= 35) {
+            if (signal.direction !== 'NEUTRAL' && signal.confidence >= 40) {
               await recordSignal({
                 coin: coin.name,
                 direction: signal.direction,

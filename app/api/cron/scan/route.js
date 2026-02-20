@@ -31,7 +31,7 @@ const PAPER_DEFAULTS = {
   rrMultiplier: 1.5,
 };
 
-const MIN_RECORD_CONFIDENCE = 35;
+const MIN_RECORD_CONFIDENCE = 40; // Only record/trade signals with 40%+ confidence
 
 function defaultPaperState() {
   return {
