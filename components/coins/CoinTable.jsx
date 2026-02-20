@@ -4,11 +4,11 @@ import Link from 'next/link';
 import clsx from 'clsx';
 import { PriceCell } from './PriceCell';
 import { SignalBadge } from '@/components/signals/SignalBadge';
-import { formatPrice, getConfidenceColor } from '@/lib/utils';
+import { formatPrice, formatNumber, getConfidenceColor } from '@/lib/utils';
 
 export function CoinTable({ coins, prices, signals }) {
-  const [sortKey, setSortKey] = useState('name');
-  const [sortDir, setSortDir] = useState('asc');
+  const [sortKey, setSortKey] = useState('volume24h');
+  const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
 
   const signalMap = useMemo(() => {
@@ -31,8 +31,20 @@ export function CoinTable({ coins, prices, signals }) {
           va = a.name; vb = b.name;
           return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
         case 'price':
-          va = prices[a.name]?.price || 0;
-          vb = prices[b.name]?.price || 0;
+          va = prices[a.name]?.price || a.price || 0;
+          vb = prices[b.name]?.price || b.price || 0;
+          break;
+        case 'volume24h':
+          va = a.volume24h || 0;
+          vb = b.volume24h || 0;
+          break;
+        case 'openInterest':
+          va = a.openInterest || 0;
+          vb = b.openInterest || 0;
+          break;
+        case 'marketCap':
+          va = a.marketCap || 0;
+          vb = b.marketCap || 0;
           break;
         case 'confidence':
           va = signalMap[a.name]?.confidence || 0;
@@ -56,6 +68,19 @@ export function CoinTable({ coins, prices, signals }) {
     else { setSortKey(key); setSortDir(key === 'name' ? 'asc' : 'desc'); }
   };
 
+  const columns = [
+    { key: 'name', label: 'Coin' },
+    { key: 'price', label: 'Price' },
+    { key: 'volume24h', label: '24h Volume' },
+    { key: 'marketCap', label: 'Market Cap' },
+    { key: 'openInterest', label: 'Open Interest' },
+    { key: 'signal', label: 'Signal' },
+    { key: 'confidence', label: 'Confidence' },
+    { key: null, label: 'Entry' },
+    { key: null, label: 'TP1' },
+    { key: null, label: 'SL' },
+  ];
+
   return (
     <div className="space-y-3">
       <input
@@ -70,20 +95,12 @@ export function CoinTable({ coins, prices, signals }) {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-zinc-800 bg-surface-200">
-              {[
-                { key: 'name', label: 'Coin' },
-                { key: 'price', label: 'Price' },
-                { key: 'signal', label: 'Signal' },
-                { key: 'confidence', label: 'Confidence' },
-                { key: null, label: 'Entry' },
-                { key: null, label: 'TP1' },
-                { key: null, label: 'SL' },
-              ].map(col => (
+              {columns.map(col => (
                 <th
                   key={col.label}
                   onClick={() => col.key && handleSort(col.key)}
                   className={clsx(
-                    'px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider',
+                    'px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider whitespace-nowrap',
                     col.key && 'cursor-pointer hover:text-zinc-300'
                   )}
                 >
@@ -101,6 +118,7 @@ export function CoinTable({ coins, prices, signals }) {
             {sorted.map(coin => {
               const priceData = prices[coin.name];
               const signal = signalMap[coin.name];
+              const currentPrice = priceData?.price || coin.price;
               return (
                 <tr
                   key={coin.name}
@@ -116,9 +134,18 @@ export function CoinTable({ coins, prices, signals }) {
                   </td>
                   <td className="px-4 py-3">
                     <PriceCell
-                      price={priceData?.price}
+                      price={priceData?.price || coin.price}
                       prevPrice={priceData?.prevPrice}
                     />
+                  </td>
+                  <td className="px-4 py-3 font-mono text-zinc-300 whitespace-nowrap">
+                    {coin.volume24h ? `$${formatNumber(coin.volume24h)}` : '—'}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-zinc-300 whitespace-nowrap">
+                    {coin.marketCap ? `$${formatNumber(coin.marketCap)}` : '—'}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-zinc-300 whitespace-nowrap">
+                    {coin.openInterest ? `$${formatNumber(coin.openInterest * (currentPrice || 1))}` : '—'}
                   </td>
                   <td className="px-4 py-3">
                     <SignalBadge direction={signal?.direction} size="sm" />
