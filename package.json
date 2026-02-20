@@ -1,6 +1,6 @@
 {
-  "name": "derivatives-scanner",
-  "version": "1.0.0",
+  "name": "hyperliquid-signals",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -8,8 +8,16 @@
     "start": "next start"
   },
   "dependencies": {
-    "next": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "next": "^14.2.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "lightweight-charts": "^4.1.0",
+    "lucide-react": "^0.400.0",
+    "clsx": "^2.1.0"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.0",
+    "postcss": "^8.4.0",
+    "autoprefixer": "^10.4.0"
   }
 }

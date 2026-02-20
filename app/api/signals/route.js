@@ -1,103 +1,115 @@
-import { NextResponse } from "next/server";
-import { fetchFuturesTickers, fetchKlines } from "@/lib/binance";
-import { calcEMA, calcRSI, calcMACD, generateSignal } from "@/lib/indicators";
+import { fetchMeta, fetchAllMids, fetchRecentCandles } from '@/lib/hyperliquid';
+import { generateSignal, calculateTPSL } from '@/lib/signals';
+import { loadLearningState, recordSignal, checkSignalOutcomes } from '@/lib/learning';
+import { TIMEFRAMES } from '@/lib/constants';
 
-export const runtime = "nodejs";
+export const dynamic = 'force-dynamic';
 
-export async function GET() {
+export async function GET(request) {
+  const { searchParams } = new URL(request.url);
+  const coinFilter = searchParams.get('coin');
+  const limit = parseInt(searchParams.get('limit') || '30', 10);
+
   try {
-    const tickers = await fetchFuturesTickers();
+    const learningState = loadLearningState();
+    const [assets, mids] = await Promise.all([fetchMeta(), fetchAllMids()]);
 
-    // Filter USDT perpetuals only and sort by quoteVolume (descending)
-    const usdtPerps = tickers
-      .filter((t) => t.symbol.endsWith("USDT"))
-      .map((t) => ({
-        symbol: t.symbol,
-        lastPrice: parseFloat(t.lastPrice),
-        priceChangePercent: parseFloat(t.priceChangePercent),
-        volume: parseFloat(t.quoteVolume || t.volume || 0)
-      }))
-      .sort((a, b) => b.volume - a.volume)
-      .slice(0, 15); // ✅ top 15 by volume instead of 30
+    // Check existing signal outcomes
+    const currentPrices = {};
+    for (const a of assets) {
+      if (mids[a.name]) currentPrices[a.name] = parseFloat(mids[a.name]);
+    }
+    checkSignalOutcomes(learningState, currentPrices);
 
-    const results = [];
+    // Determine which coins to scan
+    let coinsToScan = assets.filter(a => mids[a.name]);
+    if (coinFilter) {
+      coinsToScan = coinsToScan.filter(a => a.name === coinFilter);
+    } else {
+      coinsToScan = coinsToScan.slice(0, limit);
+    }
 
-    // Fetch klines & compute indicators for each symbol
-    await Promise.all(
-      usdtPerps.map(async (item) => {
-        try {
-          const [k4h, k1d] = await Promise.all([
-            fetchKlines(item.symbol, "4h", 200),
-            fetchKlines(item.symbol, "1d", 200)
-          ]);
+    // Fetch candles for all timeframes in parallel
+    const signals = [];
+    const batchSize = 5;
 
-          const price = item.lastPrice;
+    for (let i = 0; i < coinsToScan.length; i += batchSize) {
+      const batch = coinsToScan.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        batch.map(async (coin) => {
+          try {
+            const tfData = {};
+            const candleResults = await Promise.all(
+              TIMEFRAMES.map(async (tf) => {
+                try {
+                  const candles = await fetchRecentCandles(coin.name, tf, 300);
+                  return { tf, candles };
+                } catch {
+                  return { tf, candles: [] };
+                }
+              })
+            );
 
-          // 4H indicators
-          const ema20_4h = calcEMA(k4h.closes, 20);
-          const ema50_4h = calcEMA(k4h.closes, 50);
-          const ema200_4h = calcEMA(k4h.closes, 200);
-          const rsi4h = calcRSI(k4h.closes, 14);
-          const macd4h = calcMACD(k4h.closes);
-
-          const sig4h = generateSignal({
-            closes: k4h.closes,
-            ema20: ema20_4h,
-            ema50: ema50_4h,
-            ema200: ema200_4h,
-            rsi: rsi4h,
-            macd: macd4h,
-            price,
-            tf: "4H"
-          });
-
-          // 1D indicators
-          const ema20_1d = calcEMA(k1d.closes, 20);
-          const ema50_1d = calcEMA(k1d.closes, 50);
-          const ema200_1d = calcEMA(k1d.closes, 200);
-          const rsi1d = calcRSI(k1d.closes, 14);
-          const macd1d = calcMACD(k1d.closes);
-
-          const sig1d = generateSignal({
-            closes: k1d.closes,
-            ema20: ema20_1d,
-            ema50: ema50_1d,
-            ema200: ema200_1d,
-            rsi: rsi1d,
-            macd: macd1d,
-            price,
-            tf: "1D"
-          });
-
-          results.push({
-            ...item,
-            signals: {
-              "4h": sig4h,
-              "1d": sig1d
+            for (const { tf, candles } of candleResults) {
+              if (candles.length >= 52) tfData[tf] = candles;
             }
-          });
-        } catch (e) {
-          console.error("Error computing signals for", item.symbol, e);
-        }
-      })
-    );
 
-    // ensure results are always sorted by volume (highest first)
-    results.sort((a, b) => b.volume - a.volume);
+            if (Object.keys(tfData).length === 0) return null;
 
-    return NextResponse.json({
-      updatedAt: new Date().toISOString(),
-      count: results.length,
-      symbols: results
-    });
-  } catch (error) {
-    console.error("API /signals error:", error);
-    return NextResponse.json(
-      {
-        error: "Failed to fetch signals",
-        details: String(error?.message || error)
+            const signal = generateSignal(tfData, learningState.weights);
+            if (!signal) return null;
+
+            // Use 4h candles for TP/SL, fallback to 1h
+            const tpslCandles = tfData['4h'] || tfData['1h'] || Object.values(tfData)[0];
+            const tpsl = calculateTPSL(signal, tpslCandles, learningState);
+
+            const result = {
+              coin: coin.name,
+              price: currentPrices[coin.name],
+              ...signal,
+              ...tpsl,
+            };
+
+            // Record signal for tracking
+            if (signal.direction !== 'NEUTRAL') {
+              recordSignal({
+                coin: coin.name,
+                direction: signal.direction,
+                confidence: signal.confidence,
+                entry: tpsl?.entry,
+                stopLoss: tpsl?.stopLoss,
+                takeProfits: tpsl?.takeProfits,
+                indicatorScores: signal.timeframeResults?.['4h']?.indicators || {},
+              });
+            }
+
+            return result;
+          } catch (err) {
+            console.error(`Error processing ${coin.name}:`, err.message);
+            return null;
+          }
+        })
+      );
+
+      signals.push(...batchResults.filter(Boolean));
+    }
+
+    // Sort by confidence descending
+    signals.sort((a, b) => b.confidence - a.confidence);
+
+    return Response.json({
+      signals,
+      meta: {
+        totalCoins: coinsToScan.length,
+        signalCount: signals.length,
+        longCount: signals.filter(s => s.direction?.includes('LONG')).length,
+        shortCount: signals.filter(s => s.direction?.includes('SHORT')).length,
+        neutralCount: signals.filter(s => s.direction === 'NEUTRAL').length,
+        learningStats: learningState.stats,
       },
-      { status: 500 }
-    );
+    });
+  } catch (err) {
+    console.error('Signal generation error:', err);
+    return Response.json({ error: err.message }, { status: 500 });
   }
 }
