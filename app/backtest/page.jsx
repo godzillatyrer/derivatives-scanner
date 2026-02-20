@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Header } from '@/components/layout/Header';
 import clsx from 'clsx';
 
@@ -29,6 +29,12 @@ export default function BacktestPage() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [calibration, setCalibration] = useState(null);
+  const [calLoading, setCalLoading] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/calibration').then(r => r.json()).then(setCalibration).catch(() => {});
+  }, []);
 
   const maxHoldBars = Math.round((48 * 60 * 60 * 1000) / ({
     '15m': 15 * 60 * 1000,
@@ -235,6 +241,24 @@ export default function BacktestPage() {
         {/* Results */}
         {result && result.mode === 'single' && <SingleResult data={result} />}
         {result && result.mode === 'optimize' && <OptimizeResult data={result} />}
+
+        {/* Auto-Calibration Section */}
+        <CalibrationPanel
+          calibration={calibration}
+          loading={calLoading}
+          onRunCalibration={async () => {
+            setCalLoading(true);
+            try {
+              await fetch('/api/cron/calibrate');
+              const res = await fetch('/api/calibration');
+              setCalibration(await res.json());
+            } catch (err) {
+              console.error('Calibration error:', err);
+            } finally {
+              setCalLoading(false);
+            }
+          }}
+        />
       </div>
     </div>
   );
@@ -501,4 +525,107 @@ function BacktestEquityCurve({ data, startBalance }) {
       </svg>
     </div>
   );
+}
+
+function CalibrationPanel({ calibration, loading, onRunCalibration }) {
+  const configs = calibration?.configs || [];
+  const lastRun = calibration?.lastRun;
+  const lastRunAgo = lastRun ? formatTimeAgo(lastRun) : 'Never';
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-lg font-bold text-white">Auto-Calibration</h3>
+          <p className="text-sm text-zinc-500">
+            Runs every 6h — backtests top 20 coins and optimizes per-coin trading parameters automatically
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-zinc-500">Last run: {lastRunAgo}</span>
+          <button
+            onClick={onRunCalibration}
+            disabled={loading}
+            className={clsx(
+              'px-4 py-2 rounded-lg text-sm font-medium transition-colors',
+              loading
+                ? 'bg-zinc-700 text-zinc-400 cursor-not-allowed'
+                : 'bg-accent text-white hover:opacity-90'
+            )}
+          >
+            {loading ? (
+              <span className="flex items-center gap-2">
+                <span className="w-3 h-3 border-2 border-zinc-400 border-t-transparent rounded-full animate-spin" />
+                Calibrating...
+              </span>
+            ) : 'Run Now'}
+          </button>
+        </div>
+      </div>
+
+      {configs.length > 0 ? (
+        <div className="bg-surface-200 rounded-xl border border-zinc-800">
+          <div className="p-4 border-b border-zinc-800">
+            <h4 className="text-sm font-medium text-zinc-400">
+              {configs.length} coins calibrated — scanner uses these configs for paper trading
+            </h4>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-zinc-800">
+                  {['Coin', 'Min Conf', 'ATR SL', 'R:R', 'BT Win Rate', 'BT Return', 'BT PF', 'BT Sharpe', 'Trades', 'Calibrated'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left text-xs font-medium text-zinc-500 uppercase">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800/50">
+                {configs.map(c => (
+                  <tr key={c.coin} className="hover:bg-surface-300/50">
+                    <td className="px-3 py-2 font-medium text-white">{c.coin}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-300">{c.minConfidence}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-300">{c.atrMultiplierSL}x</td>
+                    <td className="px-3 py-2 font-mono text-zinc-300">{c.rrMultiplier}x</td>
+                    <td className="px-3 py-2">
+                      <span className={clsx('font-mono', (c.winRate || 0) >= 0.5 ? 'text-long' : 'text-short')}>
+                        {c.winRate != null ? `${(c.winRate * 100).toFixed(1)}%` : '—'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className={clsx('font-mono font-medium', (c.returnPct || 0) >= 0 ? 'text-long' : 'text-short')}>
+                        {c.returnPct != null ? formatPct(c.returnPct) : '—'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-zinc-300">
+                      {c.profitFactor != null ? (c.profitFactor === Infinity ? 'INF' : c.profitFactor.toFixed(2)) : '—'}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-zinc-300">
+                      {c.sharpe != null ? c.sharpe.toFixed(2) : '—'}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-zinc-400">{c.totalTrades || '—'}</td>
+                    <td className="px-3 py-2 text-xs text-zinc-500">{c.calibratedAt ? formatTimeAgo(c.calibratedAt) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="bg-surface-200 rounded-xl border border-zinc-800 p-12 text-center">
+          <p className="text-zinc-500 text-sm">No calibration data yet. Click "Run Now" to calibrate top coins.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatTimeAgo(ts) {
+  const seconds = Math.floor((Date.now() - ts) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
