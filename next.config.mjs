@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // we don't need any experimental flags for this app
+  reactStrictMode: true,
 };
 
 export default nextConfig;

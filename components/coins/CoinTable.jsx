@@ -1,0 +1,157 @@
+'use client';
+import { useState, useMemo } from 'react';
+import Link from 'next/link';
+import clsx from 'clsx';
+import { PriceCell } from './PriceCell';
+import { SignalBadge } from '@/components/signals/SignalBadge';
+import { formatPrice, getConfidenceColor } from '@/lib/utils';
+
+export function CoinTable({ coins, prices, signals }) {
+  const [sortKey, setSortKey] = useState('name');
+  const [sortDir, setSortDir] = useState('asc');
+  const [search, setSearch] = useState('');
+
+  const signalMap = useMemo(() => {
+    const map = {};
+    for (const s of (signals || [])) {
+      map[s.coin] = s;
+    }
+    return map;
+  }, [signals]);
+
+  const sorted = useMemo(() => {
+    let filtered = (coins || []).filter(c =>
+      c.name.toLowerCase().includes(search.toLowerCase())
+    );
+
+    filtered.sort((a, b) => {
+      let va, vb;
+      switch (sortKey) {
+        case 'name':
+          va = a.name; vb = b.name;
+          return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        case 'price':
+          va = prices[a.name]?.price || 0;
+          vb = prices[b.name]?.price || 0;
+          break;
+        case 'confidence':
+          va = signalMap[a.name]?.confidence || 0;
+          vb = signalMap[b.name]?.confidence || 0;
+          break;
+        case 'signal':
+          va = signalMap[a.name]?.score || 0;
+          vb = signalMap[b.name]?.score || 0;
+          break;
+        default:
+          return 0;
+      }
+      return sortDir === 'asc' ? va - vb : vb - va;
+    });
+
+    return filtered;
+  }, [coins, prices, signalMap, sortKey, sortDir, search]);
+
+  const handleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir(key === 'name' ? 'asc' : 'desc'); }
+  };
+
+  return (
+    <div className="space-y-3">
+      <input
+        type="text"
+        value={search}
+        onChange={e => setSearch(e.target.value)}
+        placeholder="Search coins..."
+        className="bg-surface-300 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-accent w-full max-w-xs"
+      />
+
+      <div className="overflow-x-auto rounded-xl border border-zinc-800">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-zinc-800 bg-surface-200">
+              {[
+                { key: 'name', label: 'Coin' },
+                { key: 'price', label: 'Price' },
+                { key: 'signal', label: 'Signal' },
+                { key: 'confidence', label: 'Confidence' },
+                { key: null, label: 'Entry' },
+                { key: null, label: 'TP1' },
+                { key: null, label: 'SL' },
+              ].map(col => (
+                <th
+                  key={col.label}
+                  onClick={() => col.key && handleSort(col.key)}
+                  className={clsx(
+                    'px-4 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider',
+                    col.key && 'cursor-pointer hover:text-zinc-300'
+                  )}
+                >
+                  <span className="flex items-center gap-1">
+                    {col.label}
+                    {sortKey === col.key && (
+                      <span className="text-accent">{sortDir === 'asc' ? '↑' : '↓'}</span>
+                    )}
+                  </span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-800/50">
+            {sorted.map(coin => {
+              const priceData = prices[coin.name];
+              const signal = signalMap[coin.name];
+              return (
+                <tr
+                  key={coin.name}
+                  className="hover:bg-surface-300/50 transition-colors"
+                >
+                  <td className="px-4 py-3">
+                    <Link
+                      href={`/coin/${coin.name}`}
+                      className="font-medium text-white hover:text-accent transition-colors"
+                    >
+                      {coin.name}
+                    </Link>
+                  </td>
+                  <td className="px-4 py-3">
+                    <PriceCell
+                      price={priceData?.price}
+                      prevPrice={priceData?.prevPrice}
+                    />
+                  </td>
+                  <td className="px-4 py-3">
+                    <SignalBadge direction={signal?.direction} size="sm" />
+                  </td>
+                  <td className="px-4 py-3">
+                    {signal?.confidence != null ? (
+                      <span className={clsx('font-mono font-medium', getConfidenceColor(signal.confidence))}>
+                        {signal.confidence}%
+                      </span>
+                    ) : (
+                      <span className="text-zinc-600">—</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-zinc-300">
+                    {signal?.entry ? formatPrice(signal.entry) : '—'}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-long">
+                    {signal?.takeProfits?.[0] ? formatPrice(signal.takeProfits[0]) : '—'}
+                  </td>
+                  <td className="px-4 py-3 font-mono text-short">
+                    {signal?.stopLoss ? formatPrice(signal.stopLoss) : '—'}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {sorted.length === 0 && (
+          <div className="text-center py-12 text-zinc-500 text-sm">
+            No coins found
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
